@@ -1,0 +1,44 @@
+# Friend-IM 服务器：只绑宿主机的 127.0.0.1，由宿主机上已有的反向代理（Caddy 或 Nginx）挂证书、走 443。
+# 配置写在同目录的 .env（照 .env.example 抄，不进 Git）。
+services:
+  server:
+    build:
+      context: .
+      additional_contexts:
+        # 插件仓库：服务器和插件共用的 core 在这里。默认同级目录；也可以写成 https://github.com/MagicLizi/hhh-friend-im.git#v0.1.0
+        friend-im: ${FRIEND_IM_SOURCE:-../hhh-friend-im}
+      args:
+        RUST_IMAGE: ${FRIEND_IM_RUST_IMAGE:-rust:1-slim-bookworm}
+        RUNTIME_IMAGE: ${FRIEND_IM_RUNTIME_IMAGE:-debian:bookworm-slim}
+    image: ${FRIEND_IM_IMAGE:-friend-im-server:local}
+    restart: unless-stopped
+    init: true
+    environment:
+      RUST_LOG: ${FRIEND_IM_LOG:-info}
+      FRIEND_IM_SEND_PER_SECOND: ${FRIEND_IM_SEND_PER_SECOND:-5}
+      FRIEND_IM_SEND_PER_MINUTE: ${FRIEND_IM_SEND_PER_MINUTE:-120}
+    volumes:
+      # 数据库（SQLite）和文件目录都在这个 volume 里；备份与恢复见 README。
+      - friend_im_data:/data
+    ports:
+      - "127.0.0.1:${FRIEND_IM_PORT:-8090}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # 第一期按 1000 个账号设计（契约 §7）；上传一段最多 8 MiB，一台电脑的推送队列最多 1000 条。
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 256
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  friend_im_data:

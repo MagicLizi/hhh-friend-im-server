@@ -1,0 +1,8 @@
+# 只把构建要的源码发给构建器：数据、配置、编译产物和 Git 历史都不发。
+**
+!Dockerfile
+!.dockerignore
+!Cargo.toml
+!Cargo.lock
+!src/
+!tests/

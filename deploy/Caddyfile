@@ -1,0 +1,6 @@
+# 宿主机上已有的 Caddy：把这个站点块加进 /etc/caddy/Caddyfile，域名换成自己的。
+# Caddy 自动申请、续期证书；WebSocket（/v1/ws）和文件分段上传都直接转发，不用额外配置。
+# 不开访问日志：文件请求的 Authorization 头里是登录凭证。
+im.example.com {
+    reverse_proxy 127.0.0.1:8090
+}

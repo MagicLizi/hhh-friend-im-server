@@ -1,0 +1,51 @@
+[package]
+name = "friend-im-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Friend-IM 服务器：账号、电脑、好友、群、密文消息与文件的存储和转发。只存密文，解不开。"
+
+[dependencies]
+# 两边共用的格式与校验（开发期按本机路径引用插件仓库；发版本前换成 GitHub 标签）。
+friend-im-core = { path = "../hhh-friend-im/core" }
+# HTTP 与 WebSocket。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util"] }
+# 数据库：自带 SQLite（WAL 模式），备份用 SQLite 的 backup 接口；常用查询走语句缓存（cache）。
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "backup", "cache"] }
+# 核对 Cindy 身份凭证（RS256）。只做验签这类公钥运算，用纯 Rust 的加密后端，容器里不用装 C 工具链。
+jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
+# 取 Cindy 的公钥（JWKS）。TLS 用 rustls。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.11"
+getrandom = "0.3"
+thiserror = "2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# 端到端测试直接用真的客户端库：测到的就是插件将来走的同一条路。
+friend-im-client = { path = "../hhh-friend-im/client" }
+tempfile = "3"
+# 测试里扮演 Cindy 签发方：自己生成 RSA 钥匙、发公钥、签身份凭证（版本与 jsonwebtoken 用的一致）。
+rsa = "0.9"
+rand = "0.8"
+# 绕过客户端库直接发协议请求，测服务器对坏请求的拒绝与整批回滚。
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+
+# 测试现生成 RSA 钥匙、服务器验 RS256 都靠大数运算：调试构建不优化的话一把钥匙要算几十秒。
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

@@ -7,7 +7,8 @@ license = "MIT"
 description = "Friend-IM 服务器：账号、电脑、好友、群、密文消息与文件的存储和转发。只存密文，解不开。"
 
 [dependencies]
-# 两边共用的格式与校验（开发期按本机路径引用插件仓库；发版本前换成 GitHub 标签）。
+# 两边共用的格式与校验：按同级目录引用插件仓库。版本靠取插件仓库的同名标签固定：
+# 本机 git checkout 对应标签，镜像构建在 .env 里写 FRIEND_IM_SOURCE=https://github.com/MagicLizi/hhh-friend-im.git#<标签>。
 friend-im-core = { path = "../hhh-friend-im/core" }
 # HTTP 与 WebSocket。
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json", "query"] }

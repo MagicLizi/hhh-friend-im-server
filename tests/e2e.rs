@@ -574,6 +574,99 @@ async fn interrupted_file_transfers_resume_where_they_stopped() {
     bob.wait_text("文件传完了").await;
 }
 
+// ---------- 插件接 HHH 用的三种读法：按时间读历史、会话活动、按段读文件 ----------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_by_time_activity_and_file_ranges() {
+    let env = Env::start().await;
+    let (mut alice, _) = env.account("alice", "alice 的电脑").await;
+    let (mut bob, _) = env.account("bob", "bob 的电脑").await;
+    let (carol, _) = env.account("carol", "carol 的电脑").await;
+    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    wait_notice(&mut alice, &dm, "新私聊", |c| matches!(c, ConvNotice::Created { .. })).await;
+    // 五条消息，服务器时间各不相同。
+    let mut sent = Vec::new();
+    for i in 0..5 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (log, ts) = alice.client.send(&dm, &MsgId::random(), text(&format!("第{i}条"))).await.unwrap();
+        sent.push((log, ts));
+    }
+    let ts = |i: usize| sent[i].1;
+    let read = async |since: Option<i64>, until: Option<i64>| {
+        let page = bob.client.history_in(&dm, None, 100, since, until).await.unwrap();
+        (texts(&page.items), page.more)
+    };
+    let names = |r: std::ops::RangeInclusive<usize>| r.rev().map(|i| format!("第{i}条")).collect::<Vec<_>>();
+    // 两端都含；只给一端；窗口里没有消息时是空的、没有更多。
+    assert_eq!(read(Some(ts(1)), Some(ts(3))).await, (names(1..=3), false));
+    assert_eq!(read(Some(ts(3)), None).await, (names(3..=4), false));
+    assert_eq!(read(None, Some(ts(1))).await.0, names(0..=1));
+    assert_eq!(read(Some(ts(4) + 1), None).await, (Vec::new(), false));
+    assert_eq!(read(Some(ts(0) - 10_000), Some(ts(0) - 1)).await.0, Vec::<String>::new());
+    // 系统提示也按时间筛：私聊建起来的提示早于第一条，只在不限起点时出现。
+    let notices = |items: &[HistoryItem]| items.iter().filter(|i| matches!(i, HistoryItem::Notice(_))).count();
+    assert_eq!(notices(&bob.client.history_in(&dm, None, 100, Some(ts(0)), None).await.unwrap().items), 0);
+    assert_eq!(notices(&bob.client.history_in(&dm, None, 100, None, Some(ts(0))).await.unwrap().items), 1);
+    // 时间窗口和序号游标一起翻：一页两条，翻到窗口起点为止。
+    let mut before = None;
+    let mut pages = Vec::new();
+    loop {
+        let page = bob.client.history_in(&dm, before, 2, Some(ts(1)), None).await.unwrap();
+        pages.push(texts(&page.items));
+        if !page.more {
+            break;
+        }
+        before = page.items.iter().filter(|i| matches!(i, HistoryItem::Message(_))).map(HistoryItem::log).min();
+    }
+    assert_eq!(pages, vec![names(3..=4), names(1..=2)]);
+
+    // 会话活动：只有自己所在的会话、只有编号和时间；窗口起点之后没消息就没有这个会话。
+    let activity = bob.client.activity(ts(0)).await.unwrap();
+    assert_eq!(activity.len(), 1);
+    assert_eq!((activity[0].conv.clone(), activity[0].first_ms, activity[0].latest_ms), (dm.clone(), ts(0), ts(4)));
+    assert_eq!(bob.client.activity(ts(1)).await.unwrap()[0].first_ms, ts(1));
+    assert!(bob.client.activity(ts(4) + 1).await.unwrap().is_empty());
+    assert!(carol.client.activity(0).await.unwrap().is_empty(), "不是成员看不到别人的会话活动");
+    // 退了群的人：只算退群之前的。
+    let group = alice
+        .client
+        .create_group(&GroupProfile { name: "爬山".into(), ..Default::default() }, &[bob.client.uid().clone()])
+        .await
+        .unwrap();
+    wait_notice(&mut bob, &group, "建群", |c| matches!(c, ConvNotice::Created { .. })).await;
+    let (_, before_leave) = bob.client.send(&group, &MsgId::random(), text("走之前")).await.unwrap();
+    bob.client.leave(&group).await.unwrap();
+    wait_notice(&mut alice, &group, "退群", |c| matches!(c, ConvNotice::Left)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (_, after_leave) = alice.client.send(&group, &MsgId::random(), text("走之后")).await.unwrap();
+    let mine = bob.client.activity(before_leave).await.unwrap();
+    let seen = mine.iter().find(|a| a.conv == group).expect("退群前的活动还在");
+    assert_eq!(seen.latest_ms, before_leave, "退群之后的消息不算");
+    assert!(after_leave > before_leave);
+    assert_eq!(alice.client.activity(after_leave).await.unwrap().iter().map(|a| a.conv.clone()).collect::<Vec<_>>(), vec![group]);
+
+    // 按段读文件：跨两块、正好一块、文件尾、超出文件尾；内容与原文一致。
+    let data: Vec<u8> = (0..(200 * 1024 + 13)).map(|i: u32| (i.wrapping_mul(7) % 253) as u8).collect();
+    let file = alice
+        .client
+        .upload(&dm, Cursor::new(data.clone()), data.len() as u64, "段.bin", "application/octet-stream")
+        .await
+        .unwrap();
+    let chunk = 64 * 1024u64;
+    let size = data.len() as u64;
+    for (offset, len) in [(0, 100), (chunk - 10, 20), (chunk, chunk), (3 * chunk - 1, 1024 * 1024), (size - 5, 100), (0, size)] {
+        let got = bob.client.read_range(&file, offset, len).await.unwrap();
+        let end = (offset + len).min(size);
+        assert!(got == data[offset as usize..end as usize], "读 {offset}+{len} 不对");
+    }
+    assert!(bob.client.read_range(&file, size, 10).await.unwrap().is_empty());
+    assert!(bob.client.read_range(&file, 0, 1024 * 1024 + 1).await.is_err(), "一次至多 1 MiB");
+    // 文件钥匙不对：解不开，不会给出乱码。
+    let mut wrong = file.clone();
+    wrong.key = Fixed([9; 32]);
+    assert!(bob.client.read_range(&wrong, chunk, 10).await.is_err());
+}
+
 // ---------- S19：断网、服务器停了：恢复后补收，不丢不重 ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

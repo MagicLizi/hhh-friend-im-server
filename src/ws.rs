@@ -242,7 +242,8 @@ fn run(locked: &mut Locked, hub: &crate::hub::Hub, s: &Session, req: Request, no
         Request::GetInvite { invite } => store.get_invite(s, &invite, now),
         Request::JoinByInvite { conv, link, keys } => store.join_by_invite(s, &conv, &link, &keys, now),
         Request::Send { env } => store.send(s, &env, &mut locked.limiter, now),
-        Request::History { conv, before, limit } => store.history(s, &conv, before, limit),
+        Request::History { conv, before, limit, since_ms, until_ms } => store.history(s, &conv, before, limit, since_ms, until_ms),
+        Request::Activity { since_ms } => store.activity(s, since_ms),
         Request::Sync { since, limit } => store.sync(s, since, limit),
         Request::FileCreate { conv, size } => store.file_create(s, &conv, size, now),
     }

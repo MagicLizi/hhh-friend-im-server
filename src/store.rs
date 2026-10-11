@@ -142,6 +142,8 @@ CREATE TABLE IF NOT EXISTS messages(
     UNIQUE(conv, msg)
 );
 CREATE INDEX IF NOT EXISTS messages_conv ON messages(conv, log);
+-- 按时间读历史、会话活动：时间窗口先在这里换成序号范围（v0.2.0 加，老库打开时补建，表结构不变）。
+CREATE INDEX IF NOT EXISTS messages_conv_ts ON messages(conv, ts_ms, log);
 CREATE TABLE IF NOT EXISTS files(
     file TEXT PRIMARY KEY,
     uid TEXT NOT NULL,

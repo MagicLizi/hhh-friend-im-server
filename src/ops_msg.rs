@@ -8,11 +8,14 @@ use friend_im_core::file;
 use friend_im_core::ids::{ConvId, FileId, MsgId, Uid};
 use friend_im_core::limits;
 use friend_im_core::message::{ENVELOPE_CT_MAX, Envelope};
-use friend_im_core::wire::{ErrorCode, Event, Push, Response, StoredMessage, SyncEvent, WireError};
+use friend_im_core::wire::{ConvActivity, ErrorCode, Event, Push, Response, StoredMessage, SyncEvent, WireError};
 use rusqlite::{OptionalExtension, params};
 
 use crate::ops_account::{OpResult, Session, session_hash};
 use crate::store::{DbResult, DeviceState, Effects, Store, Target, fail, from_json, internal, to_json};
+
+/// 一次会话活动查询至多回几个会话（同 HHH 插件协议 `conversations/recentActivity` 的上限）。
+const ACTIVITY_MAX: usize = 1000;
 
 /// 发送频率记录：每个账号最近一分钟的发送时间。
 pub struct RateLimiter {
@@ -196,19 +199,26 @@ impl Store {
         })
     }
 
-    /// 往前翻历史（离开过的人只能看到离开为止）。
-    pub fn history(&mut self, s: &Session, conv: &ConvId, before: Option<u64>, limit: u32) -> OpResult {
+    /// 往前翻历史（离开过的人只能看到离开为止）。`since_ms` / `until_ms` 只要这段服务器时间里的（两端都含）。
+    pub fn history(&mut self, s: &Session, conv: &ConvId, before: Option<u64>, limit: u32, since_ms: Option<i64>, until_ms: Option<i64>) -> OpResult {
         self.require_active(s)?;
         let cap = self.membership(conv, &s.uid)?.ok_or_else(|| fail(ErrorCode::Forbidden, "不是这个会话的成员"))?;
         let limit = limit.clamp(1, limits::HISTORY_PAGE_MAX);
         let before = before.map(|b| b as i64).unwrap_or(i64::MAX);
         let cap = cap.map(|c| c as i64).unwrap_or(i64::MAX);
+        let Some((lo, hi)) = self.log_window(conv, since_ms, until_ms)? else {
+            return Ok((Response::Messages { items: Vec::new(), more: false }, Effects::default()));
+        };
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT log, ts_ms, env, recalled FROM messages WHERE conv = ?1 AND log < ?2 AND log <= ?3 ORDER BY log DESC LIMIT ?4")
+            .prepare_cached(
+                "SELECT log, ts_ms, env, recalled FROM messages WHERE conv = ?1 AND log < ?2 AND log <= ?3 AND log >= ?5 AND log <= ?6 \
+                 AND ts_ms >= ?7 AND ts_ms <= ?8 ORDER BY log DESC LIMIT ?4",
+            )
             .db()?;
+        let (since, until) = (since_ms.unwrap_or(i64::MIN), until_ms.unwrap_or(i64::MAX));
         let rows = stmt
-            .query_map(params![conv.as_str(), before, cap, limit as i64 + 1], |r| {
+            .query_map(params![conv.as_str(), before, cap, limit as i64 + 1, lo, hi, since, until], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
             })
             .db()?;
@@ -226,6 +236,63 @@ impl Store {
             items.push(Self::stored(log, ts_ms, &env, recalled)?);
         }
         Ok((Response::Messages { items, more }, Effects::default()))
+    }
+
+    /// 时间窗口换成序号范围（含两端），窗口里没有消息时为 `None`。服务器按收到的先后给序号、记时间，序号越大时间越晚，
+    /// 所以按“会话 + 时间”的索引各取一端就够：翻到很早的历史也不用从最新一条往下扫。主查询仍带着时间条件，时钟回拨时也不会多给。
+    fn log_window(&self, conv: &ConvId, since_ms: Option<i64>, until_ms: Option<i64>) -> Result<Option<(i64, i64)>, WireError> {
+        let lo = match since_ms {
+            None => 0,
+            Some(since) => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached("SELECT log FROM messages WHERE conv = ?1 AND ts_ms >= ?2 ORDER BY ts_ms, log LIMIT 1")
+                    .db()?;
+                match stmt.query_row(params![conv.as_str(), since], |r| r.get::<_, i64>(0)).optional().db()? {
+                    Some(log) => log,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let hi = match until_ms {
+            None => i64::MAX,
+            Some(until) => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached("SELECT log FROM messages WHERE conv = ?1 AND ts_ms <= ?2 ORDER BY ts_ms DESC, log DESC LIMIT 1")
+                    .db()?;
+                match stmt.query_row(params![conv.as_str(), until], |r| r.get::<_, i64>(0)).optional().db()? {
+                    Some(log) => log,
+                    None => return Ok(None),
+                }
+            }
+        };
+        Ok((lo <= hi).then_some((lo, hi)))
+    }
+
+    /// 会话活动：自己所在（或离开前所在）的会话里 `since_ms` 起有消息的，每个会话给最早、最新一条的服务器时间，
+    /// 按最新一条从新到旧，至多 [`ACTIVITY_MAX`] 个。只回编号和时间，不碰内容；离开过的会话只算离开之前的。
+    pub fn activity(&mut self, s: &Session, since_ms: i64) -> OpResult {
+        self.require_active(s)?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT m.conv, MIN(m.ts_ms), MAX(m.ts_ms) FROM conv_members c JOIN messages m ON m.conv = c.conv \
+                 WHERE c.uid = ?1 AND m.ts_ms >= ?2 AND (c.left_log IS NULL OR m.log <= c.left_log) \
+                 GROUP BY m.conv ORDER BY MAX(m.ts_ms) DESC LIMIT ?3",
+            )
+            .db()?;
+        let rows = stmt
+            .query_map(params![s.uid.as_str(), since_ms, ACTIVITY_MAX as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            })
+            .db()?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (conv, first_ms, latest_ms) = row.db()?;
+            items.push(ConvActivity { conv: ConvId::parse(&conv).map_err(internal)?, first_ms, latest_ms });
+        }
+        Ok((Response::Activity { items }, Effects::default()))
     }
 
     /// 补拉序号大于 `since` 的事件。

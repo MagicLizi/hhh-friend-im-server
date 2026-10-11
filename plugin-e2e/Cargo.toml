@@ -1,0 +1,36 @@
+[package]
+name = "friend-im-plugin-e2e"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "插件端到端测试：测试扮演 HHH，和真的 Friend-IM 插件讲 HHH-IM-Protocol，插件连本机起的真服务器。"
+
+# 独立的包（自带空的 workspace）：服务器包不依赖插件，镜像构建也不碰这里（.dockerignore 只放 src、tests）。
+# 插件仓库按同级目录 ../../hhh-friend-im 引用，和服务器引用共用部分的方式一样。
+[workspace]
+
+[dev-dependencies]
+friend-im-server = { path = ".." }
+friend-im = { path = "../../hhh-friend-im" }
+friend-im-client = { path = "../../hhh-friend-im/client" }
+hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.2.0" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "process"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.11"
+# 下面这些是服务器测试的共用部分（tests/common）要的：假 Cindy、真服务器、可断网的代理。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json", "query"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rsa = "0.9"
+rand = "0.8"
+tempfile = "3"
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3

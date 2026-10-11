@@ -57,6 +57,8 @@ docker compose exec server friend-im-server healthcheck && echo 正常
 - 构建时先在 Linux 上跑完全部测试（含端到端），再出只有一个程序的运行镜像。
 - 只绑宿主机的 `127.0.0.1:8090`（`.env` 里的 `FRIEND_IM_PORT` 可改），对公网只开 443，由宿主机上已有的反向代理挂证书：
   Caddy 参考 `deploy/Caddyfile`，Nginx 参考 `deploy/nginx.conf`（WebSocket、8 MiB 的分段上传、不开访问日志都已配好）。
+  Nginx 的证书：先只启用 80 端口那段，`certbot certonly --webroot -w /var/lib/letsencrypt/friend-im -d <域名>` 申请，
+  再启用 443 那段；在 `/etc/letsencrypt/renewal-hooks/deploy/` 放一个 `nginx -t && systemctl reload nginx` 的脚本，续期后自动换上新证书。
 - 程序以非 root 用户运行、根目录只读、不带任何权限，限 1 GiB 内存。
 - 插件仓库也可以不放同级目录：在 `.env` 里写 `FRIEND_IM_SOURCE=https://github.com/MagicLizi/hhh-friend-im.git#<标签>`。
   在开发机上构建时用这个 Git 地址或一份干净的副本，免得把插件仓库的 `target/` 也传给构建器。

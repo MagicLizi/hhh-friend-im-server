@@ -519,6 +519,17 @@ async fn friends_groups_and_every_message_kind() {
     send(&alice, &group, "carol 走了之后").await;
     bob.wait_text("carol 走了之后").await;
     assert!(!texts(&carol.client.history(&group, None, 50).await.unwrap().items).contains(&"carol 走了之后".to_string()));
+    // 退群的人凭新的群邀请链接回来：她手里那份签名链停在退群时，要先用邀请回执补齐之后的环再签加入。
+    let again = alice.client.create_invite_link(&group).await.unwrap();
+    carol.client.join_by_invite(&InviteLink::parse(&again.to_string()).unwrap()).await.unwrap();
+    wait_notice(&mut alice, &group, "退群的人凭链接回来", |c| matches!(c, ConvNotice::JoinedByInvite)).await;
+    eventually("carol 回来后读得到当前一代的消息", async || {
+        let page = carol.client.history(&group, None, 50).await.ok()?;
+        texts(&page.items).contains(&"carol 走了之后".to_string()).then_some(())
+    })
+    .await;
+    send(&alice, &group, "carol 回来之后").await;
+    carol.wait_text("carol 回来之后").await;
     // 改群名：成员看得到新的。
     let renamed = GroupProfile { name: "周日爬山".into(), ..Default::default() };
     bob.client.set_group_profile(&group, &renamed).await.unwrap();

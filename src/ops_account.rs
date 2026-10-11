@@ -97,6 +97,10 @@ impl Store {
                     .optional()
                     .db()?;
                 let Some((device, uid)) = found else {
+                    // 移出时登录凭证已清掉；握手已用电脑钥匙签过名，是这台电脑本人，照实告诉它被移出了。
+                    if self.device(&device_id)?.is_some_and(|row| row.state == DeviceState::Removed) {
+                        return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号"));
+                    }
                     return Err(fail(ErrorCode::Unauthorized, "登录凭证无效，请重新登录"));
                 };
                 if device != device_id.as_str() {

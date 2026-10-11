@@ -174,9 +174,9 @@ async fn first_computer_provisions_and_second_joins_with_four_words() {
         .await;
     assert_eq!(pc1.client.devices().await.unwrap().len(), 1);
     assert!(!pc2.client.is_connected());
-    // 被移除的电脑再也登录不上，凭登录凭证或 Cindy 凭证都不行。
+    // 被移除的电脑再也登录不上，凭登录凭证或 Cindy 凭证都不行，两种都照实回“已被移出”。
     let err = Peer::connect(&env.server.url(), "笔记本", pc2_creds.clone(), None, None).await.err().unwrap();
-    assert_eq!(code(&err), Some(ErrorCode::Unauthorized));
+    assert_eq!(code(&err), Some(ErrorCode::DeviceRemoved));
     let err = Peer::connect(&env.server.url(), "笔记本", pc2_creds, Some(env.cindy.token("alice", "alice")), None)
         .await
         .err()
@@ -251,7 +251,7 @@ async fn recovery_key_joins_replacement_kills_old_key_and_logout_removes_compute
     }
     assert_eq!(pc1.client.devices().await.unwrap().len(), 2);
     let err = Peer::connect(&env.server.url(), "平板", pc3_creds.clone(), None, None).await.err().unwrap();
-    assert_eq!(code(&err), Some(ErrorCode::Unauthorized));
+    assert_eq!(code(&err), Some(ErrorCode::DeviceRemoved));
     // 用同一套电脑钥匙再登录 Cindy 也不行：要换一套新钥匙重新批准。
     let err = Peer::connect(&env.server.url(), "平板", pc3_creds, Some(env.cindy.token("alice", "alice")), None)
         .await

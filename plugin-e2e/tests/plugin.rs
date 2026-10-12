@@ -368,11 +368,10 @@ async fn disconnects_show_connecting_and_catch_up_afterwards() {
 
     env.server.proxy.cut();
     a.wait_note("status", |p| p["state"] == "connecting").await;
-    let result = a.call("messages/send", json!({ "operationId": "op-offline", "target": conversation(&dm), "content": [{ "type": "text", "text": "断网时发的" }] })).await;
-    match result {
-        Ok(outcome) => assert_eq!(outcome["state"], "unknown", "{outcome}"),
-        Err(error) => assert_eq!(error.data.unwrap().kind, hhh_im_protocol::ErrorKind::Disconnected),
-    }
+    // 断着网发：一定没发出去，回可以重试的错误（契约 S19：沿用现有失败记录，原因 + 重试），不说“不确定”。
+    let offline = json!({ "operationId": "op-offline", "target": conversation(&dm), "content": [{ "type": "text", "text": "断网时发的" }] });
+    let refused = a.call("messages/send", offline.clone()).await.expect_err("断着网发不出去");
+    assert_eq!(refused.data.unwrap().kind, hhh_im_protocol::ErrorKind::Disconnected);
     let broken = read(start + length, 1 << 20).await.expect_err("断网时读不了");
     assert_eq!(broken.data.unwrap().kind, hhh_im_protocol::ErrorKind::Disconnected, "断网是可以重试的错误");
     // 断网期间对方发来的，恢复后补收。
@@ -380,6 +379,10 @@ async fn disconnects_show_connecting_and_catch_up_afterwards() {
     env.server.proxy.restore();
     a.wait_note("status", |p| p["state"] == "online").await;
     a.wait_text("你断网时我发的").await;
+    // 宿主重试沿用同一操作编号：这次真的发出去，对方只收到一条。
+    let retried = a.call("messages/send", offline).await.unwrap();
+    assert_eq!(retried["state"], "accepted", "{retried}");
+    bob.wait("断网时发的", |u| matches!(u, Update::Message(m) if common::text_of(m).as_deref() == Some("断网时发的")).then_some(())).await;
     send_text(&a, &dm, "恢复后").await;
     // 从断处接着读完。
     let rest = read(start + length, 1 << 20).await.unwrap();
@@ -484,6 +487,29 @@ async fn group_changes_and_resets_become_system_messages() {
     assert!(matches!(&unreadable.content[0], Block::Unsupported { .. }));
     assert_eq!(unreadable.sender.id, alice.client.uid().to_string(), "放在原来那个人名下");
     assert!(history.iter().any(|m| text_of(m) == "你重置之后"));
+}
+
+// 重置过账号的人先开口（契约 S7“账号可以继续用”、S16）：在原来的私聊里直接发，好友收到这条和“X 重置了账号”的提示。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_account_can_write_to_its_friends_first() {
+    let env = Env::start().await;
+    let (alice, alice_key) = env.account("alice", "alice 的电脑").await;
+    let (bob, _bob_key) = env.account("bob", "bob 的电脑").await;
+    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    alice.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text("重置前")).await.unwrap();
+    let a_cred = plugin_computer(&env, "alice", &alice_key, "alice 的插件电脑").await;
+    let (a, _a_dir) = online(&env, &a_cred).await;
+
+    let mut fresh = env.device("bob", "bob 的新电脑").await;
+    fresh.client.reset().await.unwrap();
+    fresh.wait("可用", |u| matches!(u, Update::Activated).then_some(())).await;
+    let fresh_cred = Credential::new(&env.server.url(), fresh.client.uid().as_str(), "bob 的新电脑", fresh.client.credentials().await).encode();
+    fresh.client.close();
+    let (b, _b_dir) = online(&env, &fresh_cred).await;
+    let sent = b.call("messages/send", json!({ "operationId": "op-after-reset", "target": conversation(&dm), "content": [{ "type": "text", "text": "我重置了，先说一句" }] })).await.unwrap();
+    assert_eq!(sent["state"], "accepted", "{sent}");
+    a.wait_text("我重置了，先说一句").await;
+    a.wait_text("bob 重置了账号，之后的消息用新钥匙加密。想确认是本人，请当面或通过别的渠道问一下").await;
 }
 
 // 被移出后又被邀请回来（契约 S12：新成员能看到群里以前的全部消息）：宿主本机已有在群期间的消息、只缺不在群的那段，

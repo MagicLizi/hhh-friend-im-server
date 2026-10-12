@@ -349,6 +349,38 @@ async fn add_friend(host: &Host, link: &str) -> Value {
     ended(host, from, &flow, "action/finished").await
 }
 
+// S7、S16：在插件里“都没有了 → 重置账号”之后接着用（插件不重启）：在原来的私聊里先开口，发得出去，
+// 好友收到这条和“X 重置了账号”的提示。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_reset_in_the_plugin_the_account_keeps_working() {
+    let env = Env::start().await;
+    let (alice, _a_dir) = opened(&env, "alice", None).await;
+    let (bob, _b_dir) = opened(&env, "bob", None).await;
+    let (flow, link) = my_link(&alice).await;
+    alice.notify("action/cancel", json!({ "flowId": flow })).await;
+    add_friend(&bob, &link).await;
+    // 宿主本机早就记着这个私聊（重置的电脑上，会话列表里还在）：用这个编号发。
+    let dm = conversation_named(&alice, "bob").await;
+
+    let (again, _again_dir) = fresh(&env).await;
+    let from = mark(&again);
+    let (flow, _) = new_computer(&again, &env.cindy.token("alice", "alice"), "alice").await;
+    choose(&again, &flow, "lost", None, &[]).await;
+    step(&again, from, &flow, "重置的确认", |s| s["kind"] == "confirm").await;
+    choose(&again, &flow, "confirm", None, &[]).await;
+    step(&again, from, &flow, "重置后的恢复密钥", |s| s["layout"] == "words").await;
+    choose(&again, &flow, "confirm", None, &[]).await;
+    assert_eq!(ended(&again, from, &flow, "login/finished").await["title"], "账号已重置");
+
+    let sent = again
+        .call("messages/send", json!({ "operationId": "op-after-reset", "target": { "type": "conversation", "conversationId": dm }, "content": [{ "type": "text", "text": "我重置了，先说一句" }] }))
+        .await
+        .unwrap();
+    assert_eq!(sent["state"], "accepted", "{sent}");
+    bob.wait_text("我重置了，先说一句").await;
+    bob.wait_text("alice 重置了账号，之后的消息用新钥匙加密。想确认是本人，请当面或通过别的渠道问一下").await;
+}
+
 /// 推来过的某种会话（按名字）。
 async fn conversation_named(host: &Host, name: &str) -> String {
     host.wait(&format!("会话「{name}」"), |seen| {

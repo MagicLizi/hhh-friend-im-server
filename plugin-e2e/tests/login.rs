@@ -405,6 +405,14 @@ async fn after_a_reset_in_the_plugin_the_account_keeps_working() {
         .await
         .expect_err("重置后不能在旧群里说话");
     assert_eq!(refused.data.unwrap().user_message.as_deref(), Some("你重置过账号，要群里的人重新邀请你，才能在这个群里说话。"));
+    // 群资料解不开了，不编一个“群聊”：给空名字，宿主留着本机记着的群名（重置不删本机已有的聊天记录）。
+    let got = again.call("conversations/get", json!({ "conversationId": group })).await.unwrap();
+    assert_eq!((got["kind"].as_str(), got["name"].as_str()), (Some("group"), Some("")), "{got}");
+    let pushed = events(&again.seen.lock().unwrap());
+    assert!(
+        !pushed.iter().any(|e| matches!(e, Event::Conversation { conversation } if conversation.id == group && conversation.name == "群聊")),
+        "没推过编出来的群名"
+    );
 }
 
 /// 推来过的某种会话（按名字）。

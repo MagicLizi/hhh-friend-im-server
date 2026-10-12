@@ -14,7 +14,7 @@ description = "插件端到端测试：测试扮演 HHH，和真的 Friend-IM �
 friend-im-server = { path = ".." }
 friend-im = { path = "../../hhh-friend-im" }
 friend-im-client = { path = "../../hhh-friend-im/client" }
-hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.2.0" }
+hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.3.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "process"] }
 serde_json = "1"
 base64 = "0.22"

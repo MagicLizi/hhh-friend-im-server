@@ -350,7 +350,7 @@ async fn add_friend(host: &Host, link: &str) -> Value {
 }
 
 // S7、S16：在插件里“都没有了 → 重置账号”之后接着用（插件不重启）：在原来的私聊里先开口，发得出去，
-// 好友收到这条和“X 重置了账号”的提示。
+// 好友收到这条和“X 重置了账号”的提示（排在这条前面），本人这边写“你重置了账号”。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_a_reset_in_the_plugin_the_account_keeps_working() {
     let env = Env::start().await;
@@ -388,8 +388,11 @@ async fn after_a_reset_in_the_plugin_the_account_keeps_working() {
         .await
         .unwrap();
     assert_eq!(sent["state"], "accepted", "{sent}");
-    bob.wait_text("我重置了，先说一句").await;
-    bob.wait_text("alice 重置了账号，之后的消息用新钥匙加密。想确认是本人，请当面或通过别的渠道问一下").await;
+    let said = bob.wait_text("我重置了，先说一句").await;
+    let notice = bob.wait_text("alice 重置了账号，之后的消息用新钥匙加密。想确认是本人，请当面或通过别的渠道问一下").await;
+    assert!(notice.created_at_ms <= said.created_at_ms, "提示排在新钥匙发的第一条前面");
+    // 本人这边：说“你重置了账号”，不叫自己去核对自己。
+    again.wait_text("你重置了账号，之后的消息用新钥匙加密").await;
     again
         .wait("重置前的群没有了", |seen| {
             events(seen).into_iter().find(|e| matches!(e, Event::ConversationRemoved { conversation_id } if *conversation_id == group))

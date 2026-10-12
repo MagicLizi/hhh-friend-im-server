@@ -361,6 +361,17 @@ async fn after_a_reset_in_the_plugin_the_account_keeps_working() {
     add_friend(&bob, &link).await;
     // 宿主本机早就记着这个私聊（重置的电脑上，会话列表里还在）：用这个编号发。
     let dm = conversation_named(&alice, "bob").await;
+    // bob 建一个有 alice 的群：alice 重置后退出所有群（契约 S7），这个群在重置的电脑上推“会话没有了”。
+    let alice_uid = saved(&alice).uid;
+    let from = mark(&bob);
+    let (flow, _) = action(&bob, "group", None).await;
+    step(&bob, from, &flow, "群名", |s| s["kind"] == "input").await;
+    let from = mark(&bob);
+    submit(&bob, "action/submit", &flow, json!({ "name": "重置前的群" })).await;
+    step(&bob, from, &flow, "选好友", |s| s["kind"] == "list").await;
+    choose(&bob, &flow, "confirm", None, &[alice_uid.as_str()]).await;
+    ended(&bob, from, &flow, "action/finished").await;
+    let group = conversation_named(&alice, "重置前的群").await;
 
     let (again, _again_dir) = fresh(&env).await;
     let from = mark(&again);
@@ -379,6 +390,18 @@ async fn after_a_reset_in_the_plugin_the_account_keeps_working() {
     assert_eq!(sent["state"], "accepted", "{sent}");
     bob.wait_text("我重置了，先说一句").await;
     bob.wait_text("alice 重置了账号，之后的消息用新钥匙加密。想确认是本人，请当面或通过别的渠道问一下").await;
+    again
+        .wait("重置前的群没有了", |seen| {
+            events(seen).into_iter().find(|e| matches!(e, Event::ConversationRemoved { conversation_id } if *conversation_id == group))
+        })
+        .await;
+    let listed = again.call("conversations/list", json!({ "limit": 100 })).await.unwrap();
+    assert!(listed["items"].as_array().unwrap().iter().all(|c| c["id"] != group.as_str()), "列表里不再有它：{listed}");
+    let refused = again
+        .call("messages/send", json!({ "operationId": "op-old-group", "target": { "type": "conversation", "conversationId": group }, "content": [{ "type": "text", "text": "还能在群里说吗" }] }))
+        .await
+        .expect_err("重置后不能在旧群里说话");
+    assert_eq!(refused.data.unwrap().user_message.as_deref(), Some("你重置过账号，要群里的人重新邀请你，才能在这个群里说话。"));
 }
 
 /// 推来过的某种会话（按名字）。

@@ -376,6 +376,7 @@ async fn friends_groups_and_profiles_through_plugin_actions() {
     let (carol, _c_dir) = opened(&env, "carol", None).await;
     let alice_uid = saved(&alice).uid;
     let bob_uid = saved(&bob).uid;
+    let carol_uid = saved(&carol).uid;
 
     // S8 好友链接：换一条（先确认），旧的失效、提示写明。
     let (flow, old_link) = my_link(&alice).await;
@@ -447,13 +448,22 @@ async fn friends_groups_and_profiles_through_plugin_actions() {
     conversation_named(&carol, "周末爬山").await;
     assert!(bob.call("actions/start", json!({ "actionId": "members", "conversationId": conversation_named(&bob, "alice").await })).await.is_err(), "私聊没有群的操作");
 
-    // S13 群成员：成员看不到“移出”；群主移出 bob（先确认），回到列表带提示，bob 那边会话没有了。
+    // S13 群成员：成员看不到“移出”，别人那一行只有“发消息”；群主移出 bob（先确认），回到列表带提示，bob 那边会话没有了。
     let from = mark(&bob);
     let (flow, _) = action(&bob, "members", Some(&group)).await;
     let list = step(&bob, from, &flow, "成员看到的群成员", |s| s["kind"] == "list").await;
     assert!(list["caption"].as_str().unwrap().contains("只有群主alice能移出成员"), "{list}");
-    assert!(list["rows"].as_array().unwrap().iter().all(|r| r.get("actions").is_none()));
-    bob.notify("action/cancel", json!({ "flowId": flow })).await;
+    for row in list["rows"].as_array().unwrap() {
+        let labels: Vec<&str> = row["actions"].as_array().map(|a| a.iter().map(|x| x["label"].as_str().unwrap()).collect()).unwrap_or_default();
+        let expect: &[&str] = if row["id"] == bob_uid { &[] } else { &["发消息"] };
+        assert_eq!(labels, expect, "{row}");
+    }
+    // S10 和群成员私聊：bob 和 carol 不是好友，在群成员里点 carol 的“发消息”，两边直接出现私聊。
+    let from = mark(&bob);
+    choose(&bob, &flow, "message", Some(&carol_uid), &[]).await;
+    assert_eq!(ended(&bob, from, &flow, "action/finished").await["title"], "和「carol」私聊");
+    conversation_named(&bob, "carol").await;
+    conversation_named(&carol, "bob").await;
     let from = mark(&alice);
     let (flow, _) = action(&alice, "members", Some(&group)).await;
     let list = step(&alice, from, &flow, "群主看到的群成员", |s| s["kind"] == "list").await;

@@ -486,6 +486,35 @@ async fn group_changes_and_resets_become_system_messages() {
     assert!(history.iter().any(|m| text_of(m) == "你重置之后"));
 }
 
+// 被移出后又被邀请回来（契约 S12：新成员能看到群里以前的全部消息）：宿主本机已有在群期间的消息、只缺不在群的那段，
+// 插件把这段补推过来，不用宿主去翻历史。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_invited_back_gets_what_was_said_while_away() {
+    let env = Env::start().await;
+    let (alice, _alice_key) = env.account("alice", "alice 的电脑").await;
+    let (bob, bob_key) = env.account("bob", "bob 的电脑").await;
+    bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let b_cred = plugin_computer(&env, "bob", &bob_key, "bob 的插件电脑").await;
+    let (b, _b_dir) = online(&env, &b_cred).await;
+
+    let group = alice.client.create_group(&GroupProfile { name: "读书会".into(), ..Default::default() }, &[bob.client.uid().clone()]).await.unwrap();
+    b.wait_text("alice 创建了群，加入了 bob").await;
+    alice.client.send(&group, &friend_im_client::core::ids::MsgId::random(), text("在群的时候")).await.unwrap();
+    b.wait_text("在群的时候").await;
+    alice.client.kick(&group, bob.client.uid()).await.unwrap();
+    b.wait_text("alice 把 bob 移出了群").await;
+    alice.client.send(&group, &friend_im_client::core::ids::MsgId::random(), text("bob 不在的时候")).await.unwrap();
+    alice.client.invite(&group, &[bob.client.uid().clone()]).await.unwrap();
+    b.wait_text("alice 邀请 bob 加入了群").await;
+    let missed = b.wait_text("bob 不在的时候").await;
+    assert_eq!(missed.sender.id, alice.client.uid().to_string(), "补推的照原来的发送人");
+    let pushed = events(&b.seen.lock().unwrap())
+        .iter()
+        .filter(|e| matches!(e, Event::Messages { messages, .. } if messages.iter().any(|m| text_of(m) == "在群的时候")))
+        .count();
+    assert_eq!(pushed, 1, "在群期间收过的不再推");
+}
+
 // ---------- 真的插件程序：标准输出只有协议消息，日志里没有正文，shutdown 后退出 ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

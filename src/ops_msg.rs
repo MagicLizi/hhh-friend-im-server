@@ -79,7 +79,7 @@ type FileRow = (Uid, ConvId, u64, u64, i64, bool);
 
 impl Store {
     /// 发消息。
-    pub fn send(&mut self, s: &Session, env: &Envelope, limiter: &mut RateLimiter, now: i64) -> OpResult {
+    pub fn send(&mut self, s: &Session, env: &Envelope, limiter: &mut RateLimiter, now: i64, dispatch: bool) -> OpResult {
         self.require_active(s)?;
         if env.sender != s.uid || env.device != s.device {
             return Err(fail(ErrorCode::Forbidden, "只能用自己这台电脑发消息"));
@@ -169,10 +169,65 @@ impl Store {
             },
         };
         let mut effects = Effects::default();
-        for uid in members {
-            effects.push(Target::Account(uid), Push::Event { event: event.clone() });
+        if dispatch {
+            for uid in members {
+                effects.push(Target::Account(uid), Push::Event { event: event.clone() });
+            }
         }
         Ok((Response::Sent { log, ts_ms: now }, effects))
+    }
+
+    /// 释放一条已经由 SendLan 落库的消息：局域网成功提交的电脑不再收到服务器推送，
+    /// 其余在线电脑照常收到，所有电脑仍可从 feed 补拉。
+    pub fn release_message(&mut self, s: &Session, conv: &ConvId, id: &MsgId, direct_devices: &[friend_im_core::ids::DeviceId]) -> OpResult {
+        self.require_active(s)?;
+        if self.membership(conv, &s.uid)? != Some(None) {
+            return Err(fail(ErrorCode::Forbidden, "不是这个会话现在的成员"));
+        }
+        let row: Option<(i64, i64, String, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT log, ts_ms, env, sender, recalled FROM messages WHERE conv = ?1 AND msg = ?2",
+                params![conv.as_str(), id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .db()?;
+        let Some((log, ts_ms, env_text, sender, recalled)) = row else {
+            return Err(fail(ErrorCode::NotFound, "没有这条消息"));
+        };
+        if sender != s.uid.as_str() {
+            return Err(fail(ErrorCode::Forbidden, "只能释放自己发的消息"));
+        }
+        let env: Envelope = from_json(&env_text)?;
+        if env.device != s.device {
+            return Err(fail(ErrorCode::Forbidden, "只能由原发送电脑释放消息"));
+        }
+        // 用发送时已经写入 feed 的收件账号，而不是释放时的当前成员，避免成员
+        // 在“落库”和“释放”之间变化后收到不属于自己的消息。
+        let mut members = Vec::new();
+        let mut stmt = self.conn.prepare_cached("SELECT uid FROM feed WHERE seq = ?1").db()?;
+        let rows = stmt.query_map(params![log], |row| row.get::<_, String>(0)).db()?;
+        for row in rows {
+            members.push(Uid::parse(&row.db()?).map_err(internal)?);
+        }
+        let event = SyncEvent {
+            log: log as u64,
+            ts_ms,
+            event: Event::Message {
+                msg: StoredMessage {
+                    log: log as u64,
+                    ts_ms,
+                    env,
+                    recalled: recalled != 0,
+                },
+            },
+        };
+        let mut effects = Effects::default();
+        for uid in members {
+            effects.push(Target::AccountExcept(uid, direct_devices.to_vec()), Push::Event { event: event.clone() });
+        }
+        Ok((Response::Done, effects))
     }
 
     /// 撤回：把原消息的密文删掉，只留消息头（谁、什么时候），服务器上不再有这条的内容。

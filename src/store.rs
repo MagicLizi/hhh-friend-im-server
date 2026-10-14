@@ -183,6 +183,8 @@ pub struct Effects {
 pub enum Target {
     /// 某账号所有已批准的电脑。
     Account(Uid),
+    /// 某账号所有已批准的电脑，跳过已经由局域网提交的电脑。
+    AccountExcept(Uid, Vec<DeviceId>),
     /// 某台电脑（含还没批准的）。
     Device(DeviceId),
 }

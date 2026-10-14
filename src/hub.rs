@@ -126,9 +126,17 @@ impl Hub {
         }
         for (target, push) in &effects.pushes {
             match target {
-                Target::Account(uid) => {
+                Target::Account(uid) | Target::AccountExcept(uid, _) => {
                     let Some(devices) = inner.by_uid.get(uid) else { continue };
+                    let skipped = match target {
+                        Target::AccountExcept(_, devices) => Some(devices),
+                        Target::Account(_) => None,
+                        Target::Device(_) => unreachable!(),
+                    };
                     for device in devices {
+                        if skipped.is_some_and(|list| list.iter().any(|skip| skip == device)) {
+                            continue;
+                        }
                         for conn in inner.by_device.get(device).into_iter().flatten().filter(|c| c.approved) {
                             conn.send(Outbound::Frame(Box::new(ServerFrame::Push { push: push.clone() })));
                         }
@@ -193,5 +201,22 @@ mod tests {
         hub.unregister(&reg_a);
         assert!(!hub.is_online(&a));
         assert!(hub.is_online(&b));
+    }
+
+    #[tokio::test]
+    async fn account_except_skips_devices_already_served_by_lan() {
+        let hub = Hub::default();
+        let uid = Uid::random();
+        let (a, b) = (DeviceId::random(), DeviceId::random());
+        let (tx_a, mut rx_a) = mpsc::channel(2);
+        let (tx_b, mut rx_b) = mpsc::channel(2);
+        let _reg_a = hub.register(&uid, &a, true, tx_a, Arc::new(Notify::new()));
+        let _reg_b = hub.register(&uid, &b, true, tx_b, Arc::new(Notify::new()));
+        hub.apply(
+            &Effects { pushes: vec![(Target::AccountExcept(uid, vec![b]), Push::DeviceRemoved)], ..Default::default() },
+            None,
+        );
+        assert!(matches!(rx_a.try_recv(), Ok(Outbound::Frame(_))));
+        assert!(rx_b.try_recv().is_err());
     }
 }

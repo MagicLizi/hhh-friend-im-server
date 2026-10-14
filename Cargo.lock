@@ -539,6 +539,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-tungstenite 0.30.0",

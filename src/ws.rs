@@ -215,7 +215,7 @@ fn run(locked: &mut Locked, hub: &crate::hub::Hub, s: &Session, req: Request, no
         Request::GetAccountKeys => store.get_account_keys(s),
         Request::GetRecoveryKeys => store.get_recovery_keys(s),
         Request::ListDevices => store.list_devices(s, &|d| hub.is_online(d)),
-        Request::JoinStart { pake, proof } => store.join_start(s, &pake, &proof, now),
+        Request::JoinStart { pake, proof } => store.join_start(s, &pake, &proof, &|d| hub.is_online(d), now),
         Request::JoinRetry { request, pake } => store.join_retry(s, &request, &pake, now),
         Request::JoinConfirm { request, attempt, confirm } => store.join_confirm(s, &request, attempt, &confirm, now),
         Request::JoinCancel { request } => store.join_cancel(s, &request, now),

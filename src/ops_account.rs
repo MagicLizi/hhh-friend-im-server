@@ -503,8 +503,14 @@ impl Store {
     /// 本账号现在的电脑（“我的电脑”）。
     pub fn list_devices(&mut self, s: &Session, online: &dyn Fn(&DeviceId) -> bool) -> OpResult {
         self.require_active(s)?;
-        let devices = self
-            .devices_of(&s.uid, DeviceState::Active)?
+        let devices = self.device_infos(&s.uid, online)?;
+        Ok((Response::Devices { devices }, Effects::default()))
+    }
+
+    /// 一个账号已加入的电脑：名字、时间、此刻在不在线（“我的电脑”，新电脑请求批准时也交回这一份）。
+    pub(crate) fn device_infos(&self, uid: &Uid, online: &dyn Fn(&DeviceId) -> bool) -> Result<Vec<DeviceInfo>, WireError> {
+        Ok(self
+            .devices_of(uid, DeviceState::Active)?
             .into_iter()
             .map(|d| DeviceInfo {
                 online: online(&d.device),
@@ -513,8 +519,7 @@ impl Store {
                 joined_ms: d.joined_ms,
                 last_seen_ms: d.last_seen_ms,
             })
-            .collect();
-        Ok((Response::Devices { devices }, Effects::default()))
+            .collect())
     }
 
     /// 我的好友链接编号（没有就新建）。

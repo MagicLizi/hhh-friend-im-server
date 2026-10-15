@@ -134,8 +134,8 @@ impl Store {
         Ok(row)
     }
 
-    /// 新电脑：发起批准请求。
-    pub fn join_start(&mut self, s: &Session, pake: &Bytes, proof: &Fixed<64>, now: i64) -> OpResult {
+    /// 新电脑：发起批准请求。回执带上这个账号已加入的电脑与此刻在不在线（`online`），新电脑据此说清该去哪台批准（契约 v3）。
+    pub fn join_start(&mut self, s: &Session, pake: &Bytes, proof: &Fixed<64>, online: &dyn Fn(&DeviceId) -> bool, now: i64) -> OpResult {
         let row = self.require_pending(s)?;
         let account = self.account(&s.uid)?.ok_or_else(|| internal("找不到账号"))?;
         if !account.provisioned {
@@ -179,12 +179,14 @@ impl Store {
             .db()?;
         let row = self.join_row(&request)?.ok_or_else(|| internal("刚写的请求不见了"))?;
         effects.push(Target::Account(s.uid.clone()), Push::JoinRequested { request: self.info(&row)? });
-        tracing::info!(uid = %s.uid, "新电脑请求加入");
+        let devices = self.device_infos(&s.uid, online)?;
+        tracing::info!(uid = %s.uid, devices = devices.len(), online = devices.iter().filter(|d| d.online).count(), "新电脑请求加入");
         Ok((
             Response::JoinStarted {
                 request,
                 attempt: 1,
                 expires_ms,
+                devices: Some(devices),
             },
             effects,
         ))
@@ -208,6 +210,7 @@ impl Store {
                     request: request.clone(),
                     attempt: row.attempt,
                     expires_ms: row.expires_ms,
+                    devices: None,
                 },
                 effects,
             ));
@@ -232,6 +235,7 @@ impl Store {
                 request: request.clone(),
                 attempt,
                 expires_ms: row.expires_ms,
+                devices: None,
             },
             effects,
         ))
@@ -491,7 +495,7 @@ mod tests {
 
     fn start(store: &mut Store, s: &Session, device: &DeviceSecret, now: i64) -> Result<RequestId, WireError> {
         let proof = account_proof(device, &s.uid);
-        match store.join_start(s, &Bytes(vec![1; 33]), &proof, now)?.0 {
+        match store.join_start(s, &Bytes(vec![1; 33]), &proof, &|_| false, now)?.0 {
             Response::JoinStarted { request, .. } => Ok(request),
             other => panic!("回执不对：{other:?}"),
         }
@@ -557,7 +561,28 @@ mod tests {
     fn a_proof_for_another_account_is_rejected_before_bothering_old_computers() {
         let (mut store, _, s2, second) = account_with_pending();
         let wrong = friend_im_core::account::device_proof(&second, &Uid::random(), 0, ProofRole::Device);
-        let err = store.join_start(&s2, &Bytes(vec![1; 33]), &wrong, T0).unwrap_err();
+        let err = store.join_start(&s2, &Bytes(vec![1; 33]), &wrong, &|_| false, T0).unwrap_err();
         assert_eq!(err.code, ErrorCode::Invalid);
+    }
+
+    // 契约 v3：发起时交回账号已加入的电脑（名字、时间、此刻在不在线），本机和别的待批准电脑不算；重试不再带。
+    #[test]
+    fn starting_lists_the_joined_computers_and_whether_they_are_online() {
+        let (mut store, s1, s2, second) = account_with_pending();
+        let s3 = login(&mut store, &DeviceSecret::generate(), "另一台新电脑");
+        let proof = account_proof(&second, &s2.uid);
+        for online in [false, true] {
+            let first = s1.device.clone();
+            let is_online = move |d: &DeviceId| online && *d == first;
+            let (Response::JoinStarted { devices, request, .. }, _) = store.join_start(&s2, &Bytes(vec![1; 33]), &proof, &is_online, T0).unwrap() else {
+                panic!()
+            };
+            let devices = devices.expect("发起时带名单");
+            assert_eq!(devices.len(), 1, "只有已加入的台式机：{devices:?}");
+            assert_eq!((devices[0].id.clone(), devices[0].name.as_str(), devices[0].online), (s1.device.clone(), "台式机", online));
+            assert!(!devices.iter().any(|d| d.id == s2.device || d.id == s3.device));
+            let (Response::JoinStarted { devices, .. }, _) = store.join_retry(&s2, &request, &Bytes(vec![2; 33]), T0).unwrap() else { panic!() };
+            assert_eq!(devices, None, "重试不带名单");
+        }
     }
 }

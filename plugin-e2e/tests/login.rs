@@ -3,7 +3,8 @@
 //! 看插件推来的步骤、提醒与结果。
 //!
 //! - 登录：第一台开通出示恢复密钥；新电脑出示 4 个词，旧电脑经提醒批准（输错一次再输对）、拒绝、连错 5 次作废；改用恢复密钥；
-//!   都没有了重置账号；游客（没令牌）当场失败；令牌不进插件日志。
+//!   都没有了重置账号；游客（没令牌）当场失败；令牌不进插件日志。新电脑说清能找谁批准（契约 v3）：有电脑开着写那台的名字，
+//!   都关着先列出来、恢复密钥放主按钮，等它开了 Friend 补收请求批准。
 //! - 操作：我的电脑（移除、重新生成恢复密钥）、好友链接（换一条）、加好友（失效、不是链接、自己的）、新建群、群成员（群主
 //!   移出）、邀请成员（群邀请链接，凭链接进群）、退出群、关于加密。
 //! - 个人资料：头像只在会话里加密分发（服务器库里找不到头像地址），对方收到 `people` 事件；头像换了重新打开时再发。
@@ -13,6 +14,8 @@
 #[path = "../../tests/common/mod.rs"]
 mod common;
 mod host;
+
+use std::time::Duration;
 
 use common::*;
 use friend_im::credential::Credential;
@@ -312,6 +315,113 @@ async fn cindy_login_opens_the_account_and_approves_new_computers() {
     assert!(!text.contains(&token), "令牌进了插件日志");
     assert!(a1.bad_lines.lock().unwrap().is_empty());
     a1.close().await;
+}
+
+// ---------- 契约 v3：新电脑登录时说清能找谁批准 ----------
+
+/// 宿主重新打开一个存过凭据的插件（关掉过的电脑又开了 Friend）。
+async fn reopen(env: &Env, credential: &Credential) -> (Host, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let (host, _) = Host::start(temp.path()).await;
+    assert_eq!(host.open(&env.server.url(), Some(&credential.encode()), None).await["state"], "online");
+    (host, temp)
+}
+
+/// 都不在线那一步（契约 v3 S2b）。
+async fn all_offline(host: &Host, from: usize, flow: &str) -> Value {
+    let step = step(host, from, flow, "“你的其它电脑现在都不在线”", |s| s["kind"] == "confirm" && s["caption"] == "你的其它电脑现在都不在线").await;
+    assert_eq!(
+        (step["confirmLabel"].as_str(), step["cancelLabel"].as_str(), step["cancelChoice"].as_str(), step["links"][0]["id"].as_str()),
+        (Some("改用恢复密钥"), Some("等它上线批准"), Some("wait"), Some("lost")),
+        "{step}"
+    );
+    step
+}
+
+// S2b 旧电脑关着（没退出）：先列出它、恢复密钥放主按钮；插件的电脑名取系统电脑名，同一台机器上的几份插件同名（S2b′）。
+// S2e、S2d 走开再“改用旧电脑批准”回来；S2c 等它上线：说明写打开哪台，它开了 Friend 补收请求、批准。
+// S2a 有电脑开着：说明写那台的名字。最后都关着时用恢复密钥加入（S2d）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_computer_is_told_which_computer_can_approve_it() {
+    let env = Env::start().await;
+    let token = env.cindy.token("alice", "alice");
+
+    // 第一台开通，记下恢复密钥，然后关掉 Friend（不退出 Friend-IM）。
+    let (a1, _a1_dir) = fresh(&env).await;
+    let from = mark(&a1);
+    let flow = login(&a1, &token, "alice", None).await;
+    let recovery = step(&a1, from, &flow, "出示恢复密钥", |s| s["layout"] == "words").await["text"].as_str().unwrap().to_owned();
+    choose(&a1, &flow, "confirm", None, &[]).await;
+    ended(&a1, from, &flow, "login/finished").await;
+    let a1_credential = saved(&a1);
+    a1.close().await;
+    // 等服务器看到它断开（同机回环，几毫秒）。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // S2b、S2b′：列出关着的第一台，写加入日期、刚刚在线、和这台同名；只有一台时写“打开它的 Friend”。
+    let (b, _b_dir) = fresh(&env).await;
+    let b_from = mark(&b);
+    let b_flow = login(&b, &token, "alice", None).await;
+    let offline = all_offline(&b, b_from, &b_flow).await;
+    let sections = offline["sections"].as_array().unwrap();
+    assert_eq!(sections.len(), 1, "{offline}");
+    let name = sections[0]["title"].as_str().unwrap().to_owned();
+    let detail = sections[0]["text"].as_str().unwrap();
+    assert!(detail.starts_with("加入于 ") && detail.ends_with(" · 刚刚在线 · 和这台电脑同名"), "{detail}");
+    assert_eq!(offline["text"], "打开它的 Friend 就能批准，也可以输入开通时保存的恢复密钥。");
+
+    // S2e：下面一行进重置确认，“改用旧电脑批准”回到判断（重新问服务器，第一台还关着）。
+    let from = mark(&b);
+    choose(&b, &b_flow, "lost", None, &[]).await;
+    step(&b, from, &b_flow, "重置的确认", |s| s["kind"] == "confirm" && s["danger"] == true).await;
+    let from = mark(&b);
+    choose(&b, &b_flow, "back", None, &[]).await;
+    all_offline(&b, from, &b_flow).await;
+
+    // S2d：主按钮进恢复密钥，“改用旧电脑批准”同样回来。
+    let from = mark(&b);
+    choose(&b, &b_flow, "confirm", None, &[]).await;
+    step(&b, from, &b_flow, "恢复密钥输入框", |s| s["kind"] == "input" && s["submitLabel"] == "加入").await;
+    let from = mark(&b);
+    choose(&b, &b_flow, "back", None, &[]).await;
+    all_offline(&b, from, &b_flow).await;
+
+    // S2c：等它上线批准：出示 4 个词，说明写打开哪台；第一台开了 Friend，补收请求、弹出批准，输入 4 个词后这台加入。
+    let from = mark(&b);
+    choose(&b, &b_flow, "wait", None, &[]).await;
+    let code = step(&b, from, &b_flow, "等它上线时的 4 个词", |s| s["layout"] == "code").await;
+    assert_eq!(code["caption"], format!("打开「{name}」上的 Friend，会弹出“批准新电脑”，在里面输入下面 4 个词："));
+    assert_eq!(code["waiting"], "等待批准…（10 分钟内有效）");
+    let (a1, _a1_dir) = reopen(&env, &a1_credential).await;
+    let approve_id = pending_approval(&a1).await;
+    let from = mark(&a1);
+    let (approve_flow, _) = action(&a1, &approve_id, None).await;
+    step(&a1, from, &approve_flow, "批准的输入框", |s| s["kind"] == "input").await;
+    submit(&a1, "action/submit", &approve_flow, json!({ "words": code["text"] })).await;
+    ended(&a1, from, &approve_flow, "action/finished").await;
+    assert_eq!(ended(&b, b_from, &b_flow, "login/finished").await["title"], "这台电脑已加入");
+
+    // S2a：第一台和第二台都开着（同名只写一次）：还是 4 个词，说明写去哪台。
+    let (c, _c_dir) = fresh(&env).await;
+    let from = mark(&c);
+    let c_flow = login(&c, &token, "alice", None).await;
+    let code = step(&c, from, &c_flow, "有电脑在线时的 4 个词", |s| s["layout"] == "code").await;
+    assert_eq!(code["caption"], format!("到「{name}」上，在弹出的“批准新电脑”里输入下面 4 个词："));
+    c.notify("login/cancel", json!({ "flowId": c_flow })).await;
+
+    // 两台都关掉：列出两台、写“打开其中一台”；主按钮改用恢复密钥，输入恢复密钥加入。
+    a1.close().await;
+    b.close().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let from = mark(&c);
+    let c_flow = login(&c, &token, "alice", None).await;
+    let offline = all_offline(&c, from, &c_flow).await;
+    assert_eq!(offline["sections"].as_array().map(Vec::len), Some(2), "{offline}");
+    assert_eq!(offline["text"], "打开其中一台的 Friend 就能批准，也可以输入开通时保存的恢复密钥。");
+    choose(&c, &c_flow, "confirm", None, &[]).await;
+    step(&c, from, &c_flow, "恢复密钥输入框", |s| s["kind"] == "input" && s["submitLabel"] == "加入").await;
+    submit(&c, "login/submit", &c_flow, json!({ "key": recovery })).await;
+    assert_eq!(ended(&c, from, &c_flow, "login/finished").await["title"], "这台电脑已加入");
 }
 
 // ---------- S8、S9、S11、S12、S13、S17 与个人资料 ----------

@@ -112,8 +112,12 @@ async fn first_computer_provisions_and_second_joins_with_four_words() {
     pc2.wait("连上（待批准）", |u| matches!(u, Update::Connected { status: DeviceStatus::Pending }).then_some(())).await;
     assert!(pc2.client.convs().await.is_err());
     assert!(pc2.client.history(&dm, None, 50).await.is_err());
-    let words = pc2.client.join_start().await.unwrap();
+    let started = pc2.client.join_start().await.unwrap();
+    let words = started.code;
     assert_eq!(words.as_str().split(' ').count(), 4);
+    // 契约 v3：回执带上已加入的电脑与此刻在线，这台新电脑自己不算。
+    let listed: Vec<_> = started.devices.expect("带已登录的电脑").into_iter().map(|d| (d.name, d.online)).collect();
+    assert_eq!(listed, [("台式机".to_owned(), true)]);
     let request = pc1
         .wait("新电脑请求加入", |u| match u {
             Update::JoinRequested(info) => Some(info.clone()),
@@ -761,7 +765,7 @@ async fn join_requests_end_on_reject_cancel_or_five_wrong_codes() {
     assert!(pc1.client.join_requests().await.unwrap().is_empty());
 
     // 同时只能有一个请求：别的新电脑要等这个结束。
-    let code = pc2.client.join_start().await.unwrap();
+    let code = pc2.client.join_start().await.unwrap().code;
     let request = pc1.wait("请求加入", requested).await;
     let pc3 = env.device("alice", "平板").await;
     assert_eq!(code_of(pc3.client.join_start().await), Some(ErrorCode::Conflict));

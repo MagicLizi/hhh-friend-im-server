@@ -110,7 +110,7 @@ async fn live_against_deployed_server() {
     // S2：第二台电脑：新电脑显示 4 个词，在旧电脑上输入。
     let (mut a2, _) = connect(&token_a, "R2 账号甲的笔记本").await;
     a2.wait("连上（待批准）", |u| matches!(u, Update::Connected { status: DeviceStatus::Pending }).then_some(())).await;
-    let words = a2.client.join_start().await.unwrap();
+    let words = a2.client.join_start().await.unwrap().code;
     let request = a1
         .wait("新电脑请求加入", |u| match u {
             Update::JoinRequested(info) => Some(info.clone()),

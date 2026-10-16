@@ -65,13 +65,32 @@ pub enum CindyError {
 struct Claims {
     sub: String,
     typ: String,
+    #[serde(deserialize_with = "numeric_date")]
     iat: u64,
+    #[serde(deserialize_with = "numeric_date")]
     exp: u64,
     ctx: String,
     #[serde(default)]
     org: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
+}
+
+/// JS 里最大的安全整数：时间超过它的不收。
+const SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
+
+/// JWT 的时间（RFC 7519 NumericDate）可以带小数秒，Cindy 自 2026-10-16 起签发时间就带：取整秒（向下取整，与 HHH 一致）。
+/// 负数、非有限值与超出安全整数的不收。
+fn numeric_date<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let number = serde_json::Number::deserialize(deserializer)?;
+    if let Some(seconds) = number.as_u64() {
+        return Ok(seconds);
+    }
+    number
+        .as_f64()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0 && *seconds <= SAFE_INTEGER_MAX as f64)
+        .map(|seconds| seconds.floor() as u64)
+        .ok_or_else(|| serde::de::Error::custom("时间不是非负的秒数"))
 }
 
 #[derive(Default)]
@@ -226,5 +245,20 @@ mod tests {
         let payload = URL_SAFE_NO_PAD.encode(br#"{"iss":"https://auth.cindy.app"}"#);
         assert_eq!(peek_issuer(&format!("h.{payload}.s")).as_deref(), Some("https://auth.cindy.app"));
         assert_eq!(peek_issuer("garbage"), None);
+    }
+
+    // Cindy 自 2026-10-16 起签发时间带小数秒（RFC 7519 NumericDate 允许）：取整秒；负数、非数字、超大的不收。
+    #[test]
+    fn fractional_numeric_dates_are_read_as_whole_seconds() {
+        let claims = |iat: serde_json::Value, exp: serde_json::Value| {
+            serde_json::from_value::<Claims>(serde_json::json!({ "sub": "mem_1", "typ": "access", "iat": iat, "exp": exp, "ctx": "personal" }))
+        };
+        let read = claims(serde_json::json!(1_792_153_892.25), serde_json::json!(1_792_157_492.75)).unwrap();
+        assert_eq!((read.iat, read.exp), (1_792_153_892, 1_792_157_492));
+        let whole = claims(serde_json::json!(1_792_153_892u64), serde_json::json!(1_792_157_492u64)).unwrap();
+        assert_eq!((whole.iat, whole.exp), (1_792_153_892, 1_792_157_492));
+        for bad in [serde_json::json!(-1.5), serde_json::json!("1792153892"), serde_json::json!(f64::MAX)] {
+            assert!(claims(bad.clone(), serde_json::json!(1_792_157_492u64)).is_err(), "{bad}");
+        }
     }
 }

@@ -9,7 +9,7 @@ use friend_im_core::ids::{DeviceId, Uid};
 use friend_im_core::keys::DevicePublic;
 use friend_im_core::limits;
 use friend_im_core::wire::{
-    AccountEntry, AccountInfo, AccountKeyBundle, DeviceInfo, DeviceStatus, ErrorCode, Event, GenerationBox, GenerationWrap, Push, Response, SyncEvent,
+    AccountEntry, AccountInfo, AccountKeyBundle, DeviceInfo, DeviceKind, DeviceStatus, ErrorCode, Event, GenerationBox, GenerationWrap, Push, Response, SyncEvent,
     Welcome, WireError,
 };
 use rusqlite::{OptionalExtension, params};
@@ -46,7 +46,7 @@ pub(crate) fn session_hash(token: &[u8]) -> [u8; 32] {
 
 impl Store {
     /// 登录：Cindy 凭证（第一次）或登录凭证。返回会话身份、回执与要补发的推送。
-    pub fn login(&mut self, auth: LoginAuth, keys: DevicePublic, name: &str, now: i64) -> Result<(Session, Welcome, Effects), WireError> {
+    pub fn login(&mut self, auth: LoginAuth, keys: DevicePublic, name: &str, kind: DeviceKind, now: i64) -> Result<(Session, Welcome, Effects), WireError> {
         check_device_name(name).map_err(|e| fail(ErrorCode::BadRequest, e.to_string()))?;
         keys.check().map_err(|e| fail(ErrorCode::BadRequest, e.to_string()))?;
         let device_id = keys.id();
@@ -73,8 +73,8 @@ impl Store {
                             tracing::info!(uid = %uid, "未批准的电脑太多，删掉最早的一台");
                         }
                         tx.execute(
-                            "INSERT INTO devices(device, uid, sign_pub, enc_pub, name, status, created_ms) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
-                            params![device_id.as_str(), uid.as_str(), keys.sign.0.to_vec(), keys.enc.0.to_vec(), name, now],
+                            "INSERT INTO devices(device, uid, sign_pub, enc_pub, name, kind, status, created_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                            params![device_id.as_str(), uid.as_str(), keys.sign.0.to_vec(), keys.enc.0.to_vec(), name, kind.as_str(), now],
                         )
                         .db()?;
                     }
@@ -112,6 +112,9 @@ impl Store {
                 (Uid::parse(&uid).map_err(internal)?, None)
             }
         };
+        self.conn
+            .execute("UPDATE devices SET kind = ?1 WHERE device = ?2", params![kind.as_str(), device_id.as_str()])
+            .db()?;
         let account = self.account(&uid)?.ok_or_else(|| internal("登录后找不到账号"))?;
         let row = self.device(&device_id)?.ok_or_else(|| internal("登录后找不到电脑"))?;
         let status = match (account.provisioned, row.state) {
@@ -516,6 +519,7 @@ impl Store {
                 online: online(&d.device),
                 id: d.device,
                 name: d.name,
+                kind: d.kind,
                 joined_ms: d.joined_ms,
                 last_seen_ms: d.last_seen_ms,
             })

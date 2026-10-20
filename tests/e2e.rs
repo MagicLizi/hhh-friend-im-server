@@ -999,7 +999,7 @@ async fn forged_members_devices_and_keys_are_rejected() {
         prev: Some(last.hash()),
         ctime_ms: now_ms(),
         change: AccountChange::AddDevice {
-            device: DeviceEntry { keys: planted.public(), name: "服务器塞的电脑".into() },
+            device: DeviceEntry { keys: planted.public(), name: "服务器塞的电脑".into(), kind: friend_im_core::wire::DeviceKind::Computer },
             proof: device_proof(&planted, &alice_ref.uid, 0, ProofRole::Device),
         },
     };

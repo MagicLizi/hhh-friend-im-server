@@ -138,6 +138,7 @@ async fn hello(
         auth,
         device,
         name,
+        kind,
         sig,
     } = frame.req
     else {
@@ -159,7 +160,7 @@ async fn hello(
     let tx = tx.clone();
     let kill = kill.clone();
     app.with_store(move |locked, hub| {
-        let (session, welcome, effects) = locked.store.login(login, device, &name, now_ms())?;
+        let (session, welcome, effects) = locked.store.login(login, device, &name, kind, now_ms())?;
         let approved = welcome.status == wire::DeviceStatus::Active;
         let registration = hub.register(&session.uid, &session.device, approved, tx, kill);
         hub.reply(&registration, ServerFrame::Res {

@@ -16,11 +16,11 @@ use friend_im_core::bytes::Fixed;
 use friend_im_core::conv::{ConvLink, ConvState, Directory};
 use friend_im_core::ids::{ConvId, DeviceId, Uid};
 use friend_im_core::keys::DevicePublic;
-use friend_im_core::wire::{ErrorCode, Push, WireError};
+use friend_im_core::wire::{DeviceKind, ErrorCode, Push, WireError};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 库结构版本：改表结构时加 1 并写迁移。
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 /// 签名链现状缓存的条数上限：超过就整体清空重新按需加载（1000 个账号的规模下很少触发）。
 const CACHE_MAX: usize = 20_000;
 
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS devices(
     sign_pub BLOB NOT NULL,
     enc_pub BLOB NOT NULL,
     name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'unknown',
     status TEXT NOT NULL,
     session_hash BLOB UNIQUE,
     created_ms INTEGER NOT NULL,
@@ -231,6 +232,7 @@ pub struct DeviceRow {
     pub uid: Uid,
     pub keys: DevicePublic,
     pub name: String,
+    pub kind: DeviceKind,
     pub state: DeviceState,
     pub joined_ms: i64,
     pub last_seen_ms: i64,
@@ -318,6 +320,10 @@ impl Store {
                     .map_err(|e| e.to_string())?;
             }
             Some(Ok(v)) if v == SCHEMA_VERSION => {}
+            Some(Ok(1)) => {
+                conn.execute("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'computer'", []).map_err(|e| e.to_string())?;
+                conn.execute("UPDATE meta SET value = ?1 WHERE key = 'schema_version'", params![SCHEMA_VERSION.to_string()]).map_err(|e| e.to_string())?;
+            }
             Some(other) => return Err(format!("数据库结构版本不认识：{other:?}")),
         }
         let last_log: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM log", [], |r| r.get(0)).map_err(|e| e.to_string())?;
@@ -395,13 +401,13 @@ impl Store {
     pub(crate) fn device(&self, device: &DeviceId) -> Result<Option<DeviceRow>, WireError> {
         self.conn
             .query_row(
-                "SELECT uid, sign_pub, enc_pub, name, status, joined_ms, last_seen_ms FROM devices WHERE device = ?1",
+                "SELECT uid, sign_pub, enc_pub, name, kind, status, joined_ms, last_seen_ms FROM devices WHERE device = ?1",
                 params![device.as_str()],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get(5)?, r.get(6)?)),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?, r.get(6)?, r.get(7)?)),
             )
             .optional()
             .db()?
-            .map(|(uid, sign, enc, name, status, joined_ms, last_seen_ms)| {
+            .map(|(uid, sign, enc, name, kind, status, joined_ms, last_seen_ms)| {
                 Ok(DeviceRow {
                     device: device.clone(),
                     uid: Uid::parse(&uid).map_err(internal)?,
@@ -410,6 +416,7 @@ impl Store {
                         enc: Fixed::from_slice(&enc).ok_or_else(|| internal("收件公钥长度不对"))?,
                     },
                     name,
+                    kind: DeviceKind::parse(&kind),
                     state: DeviceState::parse(&status),
                     joined_ms,
                     last_seen_ms,
@@ -586,6 +593,9 @@ pub(crate) fn open_memory() -> Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cindy::CindyIdentity;
+    use crate::ops_account::LoginAuth;
+    use friend_im_core::keys::DeviceSecret;
 
     #[test]
     fn schema_is_created_and_reopen_keeps_version() {
@@ -595,8 +605,48 @@ mod tests {
         drop(store);
         let store = Store::open(&dir).unwrap();
         let version: String = store.conn.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, "1");
+        assert_eq!(version, "2");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn v1_schema_migrates_device_kind_as_computer() {
+        let dir = std::env::temp_dir().join(format!("friend-im-schema-v1-{}", ConvId::random()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("friend-im.sqlite3");
+        let conn = Connection::open(&db).unwrap();
+        let uid = Uid::from_cindy("https://auth.cindy.app", "migration");
+        let device = DeviceSecret::generate();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES ('schema_version', '1');
+             CREATE TABLE accounts(uid TEXT PRIMARY KEY, name TEXT NOT NULL, epoch INTEGER NOT NULL DEFAULT 0, provisioned INTEGER NOT NULL DEFAULT 0, rotation_needed INTEGER NOT NULL DEFAULT 0, friend_token BLOB UNIQUE, storage_bytes INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL);
+             CREATE TABLE devices(device TEXT PRIMARY KEY, uid TEXT NOT NULL, sign_pub BLOB NOT NULL, enc_pub BLOB NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL, session_hash BLOB UNIQUE, created_ms INTEGER NOT NULL, joined_ms INTEGER NOT NULL DEFAULT 0, last_seen_ms INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE log(seq INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO accounts(uid, name, created_ms) VALUES(?1, 'migration', 1)", params![uid.as_str()]).unwrap();
+        conn.execute("INSERT INTO devices(device, uid, sign_pub, enc_pub, name, status, created_ms) VALUES(?1, ?2, ?3, ?4, '旧电脑', 'pending', 1)", params![device.id().as_str(), uid.as_str(), device.public().sign.0.to_vec(), device.public().enc.0.to_vec()]).unwrap();
+        drop(conn);
+
+        let store = Store::open(&dir).unwrap();
+        let row = store.device(&device.id()).unwrap().unwrap();
+        assert_eq!(row.kind, DeviceKind::Computer);
+        let version: String = store.conn.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, "2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn login_persists_mobile_device_kind() {
+        let mut store = open_memory();
+        let identity = CindyIdentity { issuer: "https://auth.cindy.app".into(), member: "mobile-user".into(), name: "手机用户".into() };
+        let device = DeviceSecret::generate();
+        let session = store
+            .login(LoginAuth::Cindy(identity), device.public(), "我的手机", DeviceKind::Mobile, 1)
+            .unwrap()
+            .0;
+        assert_eq!(store.device(&session.device).unwrap().unwrap().kind, DeviceKind::Mobile);
     }
 
     #[test]

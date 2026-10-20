@@ -10,6 +10,8 @@ use friend_im_core::bytes::{Bytes, Fixed};
 use friend_im_core::ids::{DeviceId, RequestId, Uid};
 use friend_im_core::limits;
 use friend_im_core::wire::{AccountKeyBundle, ErrorCode, JoinCloseReason, JoinRequestInfo, Push, Response, WireError};
+#[cfg(test)]
+use friend_im_core::wire::DeviceKind;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +100,7 @@ impl Store {
             request: row.request.clone(),
             device: device.keys,
             name: device.name,
+            kind: device.kind,
             created_ms: row.created_ms,
             expires_ms: row.expires_ms,
             attempt: row.attempt,
@@ -468,7 +471,7 @@ mod tests {
             member: "alice".into(),
             name: "alice".into(),
         };
-        store.login(LoginAuth::Cindy(identity), device.public(), name, T0).unwrap().0
+        store.login(LoginAuth::Cindy(identity), device.public(), name, DeviceKind::Computer, T0).unwrap().0
     }
 
     /// 开通好的账号 + 一台待批准的新电脑。
@@ -478,7 +481,7 @@ mod tests {
         let s1 = login(&mut store, &first, "台式机");
         let recovery = RecoveryKey::generate().device_secret();
         let seed = AccountSeed::generate();
-        let entry = DeviceEntry { keys: first.public(), name: "台式机".into() };
+        let entry = DeviceEntry { keys: first.public(), name: "台式机".into(), kind: DeviceKind::Computer };
         let link = AccountLink::sign(&eldest_body(&s1.uid, 0, entry, &recovery, seed.public(1), T0), &first);
         let boxes = [first.public(), recovery.public()]
             .into_iter()

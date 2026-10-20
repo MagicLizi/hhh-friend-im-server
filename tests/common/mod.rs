@@ -508,7 +508,7 @@ impl Raw {
             auth,
             device: device.public(),
             name: name.into(),
-            kind: friend_im_core::wire::DeviceKind::Computer,
+            kind: friend_im_client::core::wire::DeviceKind::Computer,
             sig: wire::sign_hello(device, &nonce),
         };
         match raw.request(hello).await? {

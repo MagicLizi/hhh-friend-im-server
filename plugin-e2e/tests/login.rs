@@ -167,7 +167,7 @@ async fn cindy_login_opens_the_account_and_approves_new_computers() {
     let a1_dir = tempfile::tempdir().unwrap();
     let (a1, init) = Host::spawn(&host::program(), a1_dir.path()).await;
     assert_eq!(init["loginMethods"][0]["kind"], "host");
-    assert_eq!(init["actions"].as_array().unwrap().len(), 8);
+    assert_eq!(init["actions"].as_array().unwrap().len(), 9);
     assert_eq!(a1.open(&env.server.url(), None, None).await["state"], "needsLogin");
     let from = mark(&a1);
     let flow = login(&a1, &token, "alice", Some(AVATAR_A1)).await;

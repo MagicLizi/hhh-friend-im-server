@@ -531,27 +531,32 @@ dependencies = [
 
 [[package]]
 name = "friend-im"
-version = "0.3.7"
+version = "0.3.10"
 dependencies = [
  "base64 0.22.1",
  "friend-im-client",
  "hhh-im-protocol",
  "imagesize",
- "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wasip2",
 ]
 
 [[package]]
 name = "friend-im-client"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "friend-im-core",
  "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "reqwest",
  "rustls",
  "serde",
@@ -559,6 +564,7 @@ dependencies = [
  "socket2",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "tracing",
  "webpki-roots 1.0.9",
@@ -1672,6 +1678,7 @@ version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2545,6 +2552,9 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+dependencies = [
+ "bitflags",
+]
 
 [[package]]
 name = "writeable"

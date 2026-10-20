@@ -426,6 +426,144 @@ async fn a_new_computer_is_told_which_computer_can_approve_it() {
 
 // ---------- S8、S9、S11、S12、S13、S17 与个人资料 ----------
 
+/// 接在真服务的直连地址上，代理只切断另一台设备。
+async fn fresh_direct(env: &Env) -> (Host, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let (host, _) = Host::start(temp.path()).await;
+    assert_eq!(host.open(&format!("http://{}", env.server.direct), None, None).await["state"], "needsLogin");
+    (host, temp)
+}
+
+async fn approve_with(host: &Host, words: &str) {
+    let id = pending_approval(host).await;
+    let from = mark(host);
+    let (flow, _) = action(host, &id, None).await;
+    step(host, from, &flow, "批准输入框", |s| s["kind"] == "input").await;
+    submit(host, "action/submit", &flow, json!({ "words": words })).await;
+    let done = ended(host, from, &flow, "action/finished").await;
+    assert!(done["title"].as_str().is_some_and(|s| s.starts_with("已批准「")), "本机保留成功反馈：{done}");
+}
+
+async fn no_pending_approval(host: &Host) {
+    wait_notices(host, "过时批准提醒已撤下", |n| !n.iter().any(|x| x["prompt"] == true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approval_on_another_device_closes_the_waiting_flow() {
+    let env = Env::start().await;
+    let token = env.cindy.token("alice", "alice");
+    let (a, _a_dir) = opened(&env, "alice", None).await;
+    let (b, _b_dir) = fresh(&env).await;
+    let (b_login, words) = new_computer(&b, &token, "alice").await;
+    approve_with(&a, &words).await;
+    ended(&b, 0, &b_login, "login/finished").await;
+    no_pending_approval(&a).await;
+
+    let (c, _c_dir) = fresh(&env).await;
+    let (c_login, words) = new_computer(&c, &token, "alice").await;
+    let id = pending_approval(&b).await;
+    let from = mark(&b);
+    let (b_flow, _) = action(&b, &id, None).await;
+    step(&b, from, &b_flow, "另一台打开批准框", |s| s["kind"] == "input").await;
+    // 曾经提交过不代表最终是本机批准，不能用一个 submitted 标志认领成功。
+    submit(&b, "action/submit", &b_flow, json!({ "words": wrong(&words) })).await;
+    step(&b, from, &b_flow, "错误验证码可重试", |s| s["note"]["text"].as_str().is_some_and(|s| s.contains("还能试"))).await;
+    approve_with(&a, &words).await;
+    ended(&c, 0, &c_login, "login/finished").await;
+    let done = ended(&b, from, &b_flow, "action/finished").await;
+    assert!(done["title"].is_null() && done["message"].is_null(), "别台处理后自动关闭，不留成功页：{done}");
+    no_pending_approval(&a).await;
+    no_pending_approval(&b).await;
+    a.close().await;
+    b.close().await;
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approval_requests_reconcile_after_reconnection() {
+    let env = Env::start().await;
+    let token = env.cindy.token("alice", "alice");
+    let (a, _a_dir) = opened(&env, "alice", None).await;
+    let (b, _b_dir) = fresh_direct(&env).await;
+    let (b_login, words) = new_computer(&b, &token, "alice").await;
+    approve_with(&a, &words).await;
+    ended(&b, 0, &b_login, "login/finished").await;
+    no_pending_approval(&a).await;
+    let credential = saved(&a);
+
+    env.server.proxy.cut();
+    a.wait("已断网", |seen| {
+        seen.iter().rev().find_map(|s| match s {
+            Seen::Note(m, p) if m == "status" && p["state"] == "connecting" => Some(()),
+            _ => None,
+        })
+    })
+    .await;
+    let (c, _c_dir) = fresh_direct(&env).await;
+    let (c_login, words) = new_computer(&c, &token, "alice").await;
+    let id = pending_approval(&b).await;
+    env.server.proxy.restore();
+    assert_eq!(pending_approval(&a).await, id, "断网期间新来的请求须自动补上");
+    let from = mark(&a);
+    let (a_flow, _) = action(&a, &id, None).await;
+    step(&a, from, &a_flow, "重连后打开批准框", |s| s["kind"] == "input").await;
+
+    let disconnected_from = mark(&a);
+    env.server.proxy.cut();
+    a.wait("再次断网", |seen| {
+        seen[disconnected_from.min(seen.len())..].iter().find_map(|s| match s {
+            Seen::Note(m, p) if m == "status" && p["state"] == "connecting" => Some(()),
+            _ => None,
+        })
+    })
+    .await;
+    approve_with(&b, &words).await;
+    ended(&c, 0, &c_login, "login/finished").await;
+    env.server.proxy.restore();
+    let done = ended(&a, from, &a_flow, "action/finished").await;
+    assert!(done["title"].is_null() && done["message"].is_null(), "重连后过时弹窗自动收起：{done}");
+    no_pending_approval(&a).await;
+    a.close().await;
+    let (a, _restarted) = reopen(&env, &credential).await;
+    // 必须等实际补读完成，不能把初始空列表算作通过。
+    a.wait("重启后收到最新待办快照", |seen| seen.iter().any(|s| matches!(s, Seen::Note(m, _) if m == "session/notice")).then_some(())).await;
+    no_pending_approval(&a).await;
+    a.close().await;
+    b.close().await;
+    c.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approval_submitted_on_two_devices_has_only_one_success_page() {
+    let env = Env::start().await;
+    let token = env.cindy.token("alice", "alice");
+    let (a, _a_dir) = opened(&env, "alice", None).await;
+    let (b, _b_dir) = fresh(&env).await;
+    let (b_login, words) = new_computer(&b, &token, "alice").await;
+    approve_with(&a, &words).await;
+    ended(&b, 0, &b_login, "login/finished").await;
+    no_pending_approval(&a).await;
+    let (c, _c_dir) = fresh(&env).await;
+    let (c_login, words) = new_computer(&c, &token, "alice").await;
+    let id = pending_approval(&a).await;
+    assert_eq!(pending_approval(&b).await, id);
+    let (a_from, b_from) = (mark(&a), mark(&b));
+    let (a_flow, _) = action(&a, &id, None).await;
+    let (b_flow, _) = action(&b, &id, None).await;
+    step(&a, a_from, &a_flow, "A 批准输入框", |s| s["kind"] == "input").await;
+    step(&b, b_from, &b_flow, "B 批准输入框", |s| s["kind"] == "input").await;
+    tokio::join!(submit(&a, "action/submit", &a_flow, json!({ "words": words })), submit(&b, "action/submit", &b_flow, json!({ "words": words })));
+    ended(&c, 0, &c_login, "login/finished").await;
+    let a_done = ended(&a, a_from, &a_flow, "action/finished").await;
+    let b_done = ended(&b, b_from, &b_flow, "action/finished").await;
+    assert_ne!(a_done["title"].is_null(), b_done["title"].is_null(), "只有实际批准者留成功反馈：{a_done} / {b_done}");
+    no_pending_approval(&a).await;
+    no_pending_approval(&b).await;
+    a.close().await;
+    b.close().await;
+    c.close().await;
+}
+
 /// 一个用 Cindy 账号开通好的插件（第一台电脑），返回插件与它的目录。
 async fn opened(env: &Env, member: &str, avatar: Option<&str>) -> (Host, tempfile::TempDir) {
     let (host, dir) = fresh(env).await;

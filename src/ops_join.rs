@@ -260,6 +260,14 @@ impl Store {
             pake: pake.clone(),
             confirm: *confirm,
         };
+        // 一次 SPAKE2 尝试只能有一个回应，否则会把第一台的确认码转给第二台，造成误拒绝。
+        // 完全相同的重发仍可重推；换回应必须由新设备开始下一次尝试。
+        if row.responder.is_some()
+            && !(row.responder.as_ref() == Some(&s.device)
+                && row.answer.as_ref().is_some_and(|a| a.attempt == attempt && a.pake == *pake && a.confirm == *confirm))
+        {
+            return Err(fail(ErrorCode::Conflict, "这次尝试已有设备正在核对"));
+        }
         self.conn
             .execute(
                 "UPDATE joins SET responder = ?1, answer = ?2 WHERE request = ?3",
@@ -515,6 +523,22 @@ mod tests {
             .filter(|(_, p)| matches!(p, Push::JoinClosed { reason: r, .. } if *r == reason))
             .map(|(t, _)| t.clone())
             .collect()
+    }
+
+    #[test]
+    fn one_attempt_keeps_its_first_answer_until_the_new_device_retries() {
+        let (mut store, s1, s2, second) = account_with_pending();
+        let request = start(&mut store, &s2, &second, T0).unwrap();
+        let first = Bytes(vec![2; 33]);
+        let second_answer = Bytes(vec![3; 33]);
+        let confirm = Fixed([4; 32]);
+        store.join_respond(&s1, &request, 1, &first, &confirm, T0).unwrap();
+        store.join_respond(&s1, &request, 1, &first, &confirm, T0).unwrap();
+        let err = store.join_respond(&s1, &request, 1, &second_answer, &confirm, T0).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(store.join_row(&request).unwrap().unwrap().answer.unwrap().pake, first);
+        store.join_retry(&s2, &request, &Bytes(vec![5; 33]), T0).unwrap();
+        store.join_respond(&s1, &request, 2, &second_answer, &confirm, T0).unwrap();
     }
 
     #[test]

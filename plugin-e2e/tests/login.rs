@@ -7,7 +7,8 @@
 //!   都关着先列出来、恢复密钥放主按钮，等它开了 Friend 补收请求批准。
 //! - 操作：我的电脑（移除、重新生成恢复密钥）、好友链接（换一条）、加好友（失效、不是链接、自己的）、新建群、群成员（群主
 //!   移出）、邀请成员（群邀请链接，凭链接进群）、退出群、关于加密。
-//! - 个人资料：头像只在会话里加密分发（服务器库里找不到头像地址），对方收到 `people` 事件；头像换了重新打开时再发。
+//! - 个人资料（契约 friend-im v6）：宿主经 `account/avatar` 交来头像，插件往会话里传一份加密头像（服务器上找不到头像的明文），
+//!   对方收到带头像键的 `people` 事件、按键读出的就是那张；换了头像再发一份。
 //!
 //! 新电脑等批准超过 10 分钟的作废在服务器测试里验（这里不改服务器的时限）。
 
@@ -17,15 +18,59 @@ mod host;
 
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use common::*;
 use friend_im::credential::Credential;
 use hhh_im_protocol::types::Event;
 use host::{Host, Seen, events};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-const AVATAR_A1: &str = "https://avatar.cindy.test/u/alice-1.png";
-const AVATAR_A2: &str = "https://avatar.cindy.test/u/alice-2.png";
-const AVATAR_B: &str = "https://avatar.cindy.test/u/bob.png";
+/// 登录时宿主给的 Cindy 头像地址：插件只记进凭据，不再拿它当头像（契约 friend-im v6）。
+const CINDY_AVATAR: &str = "https://avatar.cindy.test/u/alice.png";
+/// 假头像里认得出的明文，查服务器上有没有头像明文用。
+const PHOTO_MARK: &str = "friend-im-e2e-photo:";
+
+fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 一张假的 PNG 头像：文件头加上认得出的明文。
+fn photo(name: &str) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend_from_slice(format!("{PHOTO_MARK}{name}").as_bytes());
+    bytes
+}
+
+/// 宿主交来本机用户的头像（`account/avatar`，契约 provider-protocol v35）。
+async fn hand_avatar(host: &Host, bytes: &[u8]) {
+    let avatar = json!({ "mime": "image/png", "data": BASE64.encode(bytes), "sha256": sha256_hex(bytes), "size": bytes.len() });
+    host.call("account/avatar", json!({ "avatar": avatar })).await.expect("account/avatar");
+}
+
+/// 按头像键读出整张头像（`avatars/read`）。
+async fn read_avatar(host: &Host, key: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = host.call("avatars/read", json!({ "key": key, "offset": bytes.len(), "length": 64 * 1024 })).await.expect("avatars/read");
+        bytes.extend(BASE64.decode(chunk["data"].as_str().unwrap()).unwrap());
+        if chunk["eof"] == true {
+            return bytes;
+        }
+    }
+}
+
+/// 服务器数据目录（库、预写日志、文件）里有没有这段明文。
+fn on_server(env: &Env, needle: &[u8]) -> bool {
+    fn found(dir: &std::path::Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(dir).unwrap().flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() { found(&path, needle) } else { std::fs::read(&path).unwrap_or_default().windows(needle.len()).any(|w| w == needle) }
+        })
+    }
+    found(env.server.dir.path(), needle)
+}
 
 /// 起一个插件，没有凭据打开：插件回“要登录”。
 async fn fresh(env: &Env) -> (Host, tempfile::TempDir) {
@@ -170,7 +215,7 @@ async fn cindy_login_opens_the_account_and_approves_new_computers() {
     assert_eq!(init["actions"].as_array().unwrap().len(), 9);
     assert_eq!(a1.open(&env.server.url(), None, None).await["state"], "needsLogin");
     let from = mark(&a1);
-    let flow = login(&a1, &token, "alice", Some(AVATAR_A1)).await;
+    let flow = login(&a1, &token, "alice", Some(CINDY_AVATAR)).await;
     let key_step = step(&a1, from, &flow, "出示恢复密钥", |s| s["kind"] == "showText" && s["layout"] == "words").await;
     assert_eq!(key_step["noCancel"], true);
     assert_eq!(key_step["ack"], "我已保存恢复密钥");
@@ -184,10 +229,10 @@ async fn cindy_login_opens_the_account_and_approves_new_computers() {
     }
     choose(&a1, &flow, "confirm", None, &[]).await;
     let done = ended(&a1, from, &flow, "login/finished").await;
-    assert_eq!(done["title"], "Friend-IM 已开通");
+    assert_eq!(done["title"], "Cindy IM 已开通");
     assert_eq!(done["account"]["name"], "alice");
-    assert_eq!(done["account"]["avatar"], AVATAR_A1, "自己的头像键就是 Cindy 头像地址");
-    assert_eq!(saved(&a1).avatar.as_deref(), Some(AVATAR_A1), "头像记进凭据");
+    assert!(done["account"]["avatar"].is_null(), "宿主还没交头像，不拿 Cindy 头像地址当头像：{done}");
+    assert_eq!(saved(&a1).avatar.as_deref(), Some(CINDY_AVATAR), "Cindy 头像地址仍记进凭据");
     a1.call("conversations/list", json!({ "limit": 10 })).await.expect("登录完就在线");
 
     // S2、S21 新电脑：出示 4 个词；旧电脑收到要直接弹出的提醒，经“查看”批准：先输错一次（两边都有提示），再输对。
@@ -452,7 +497,7 @@ async fn no_pending_approval(host: &Host) {
 async fn approval_on_another_device_closes_the_waiting_flow() {
     let env = Env::start().await;
     let token = env.cindy.token("alice", "alice");
-    let (a, _a_dir) = opened(&env, "alice", None).await;
+    let (a, _a_dir) = opened(&env, "alice").await;
     let (b, _b_dir) = fresh(&env).await;
     let (b_login, words) = new_computer(&b, &token, "alice").await;
     approve_with(&a, &words).await;
@@ -483,7 +528,7 @@ async fn approval_on_another_device_closes_the_waiting_flow() {
 async fn approval_requests_reconcile_after_reconnection() {
     let env = Env::start().await;
     let token = env.cindy.token("alice", "alice");
-    let (a, _a_dir) = opened(&env, "alice", None).await;
+    let (a, _a_dir) = opened(&env, "alice").await;
     let (b, _b_dir) = fresh_direct(&env).await;
     let (b_login, words) = new_computer(&b, &token, "alice").await;
     approve_with(&a, &words).await;
@@ -537,7 +582,7 @@ async fn approval_requests_reconcile_after_reconnection() {
 async fn approval_submitted_on_two_devices_has_only_one_success_page() {
     let env = Env::start().await;
     let token = env.cindy.token("alice", "alice");
-    let (a, _a_dir) = opened(&env, "alice", None).await;
+    let (a, _a_dir) = opened(&env, "alice").await;
     let (b, _b_dir) = fresh(&env).await;
     let (b_login, words) = new_computer(&b, &token, "alice").await;
     approve_with(&a, &words).await;
@@ -565,10 +610,10 @@ async fn approval_submitted_on_two_devices_has_only_one_success_page() {
 }
 
 /// 一个用 Cindy 账号开通好的插件（第一台电脑），返回插件与它的目录。
-async fn opened(env: &Env, member: &str, avatar: Option<&str>) -> (Host, tempfile::TempDir) {
+async fn opened(env: &Env, member: &str) -> (Host, tempfile::TempDir) {
     let (host, dir) = fresh(env).await;
     let from = mark(&host);
-    let flow = login(&host, &env.cindy.token(member, member), member, avatar).await;
+    let flow = login(&host, &env.cindy.token(member, member), member, None).await;
     step(&host, from, &flow, "出示恢复密钥", |s| s["layout"] == "words").await;
     choose(&host, &flow, "confirm", None, &[]).await;
     ended(&host, from, &flow, "login/finished").await;
@@ -602,8 +647,8 @@ async fn add_friend(host: &Host, link: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn after_a_reset_in_the_plugin_the_account_keeps_working() {
     let env = Env::start().await;
-    let (alice, _a_dir) = opened(&env, "alice", None).await;
-    let (bob, _b_dir) = opened(&env, "bob", None).await;
+    let (alice, _a_dir) = opened(&env, "alice").await;
+    let (bob, _b_dir) = opened(&env, "bob").await;
     let (flow, link) = my_link(&alice).await;
     alice.notify("action/cancel", json!({ "flowId": flow })).await;
     add_friend(&bob, &link).await;
@@ -685,12 +730,20 @@ fn avatar_in(seen: &[Seen], uid: &str) -> Option<Option<String>> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn friends_groups_and_profiles_through_plugin_actions() {
     let env = Env::start().await;
-    let (alice, _a_dir) = opened(&env, "alice", Some(AVATAR_A1)).await;
-    let (bob, _b_dir) = opened(&env, "bob", Some(AVATAR_B)).await;
-    let (carol, _c_dir) = opened(&env, "carol", None).await;
+    let (alice, _a_dir) = opened(&env, "alice").await;
+    let (bob, _b_dir) = opened(&env, "bob").await;
+    let (carol, _c_dir) = opened(&env, "carol").await;
     let alice_uid = saved(&alice).uid;
     let bob_uid = saved(&bob).uid;
     let carol_uid = saved(&carol).uid;
+
+    // 上线后宿主交来头像（carol 没有）：还没有会话，先记下（自己的头像键直接读出这张），之后进的会话里再发。
+    let (alice_photo, bob_photo) = (photo("alice-1"), photo("bob"));
+    hand_avatar(&alice, &alice_photo).await;
+    hand_avatar(&bob, &bob_photo).await;
+    let own = alice.wait("自己的头像", |seen| avatar_in(seen, &alice_uid).flatten()).await;
+    assert!(own.starts_with("fim-self:"), "{own}");
+    assert_eq!(read_avatar(&alice, &own).await, alice_photo);
 
     // S8 好友链接：换一条（先确认），旧的失效、提示写明。
     let (flow, old_link) = my_link(&alice).await;
@@ -728,16 +781,16 @@ async fn friends_groups_and_profiles_through_plugin_actions() {
     carol.notify("action/cancel", json!({ "flowId": flow })).await;
     add_friend(&carol, &link).await;
 
-    // 个人资料：加好友后两边各发一条，对方收到 people 事件带头像；carol 没有头像。服务器库里找不到头像地址。
-    alice.wait("bob 的头像", |seen| avatar_in(seen, &bob_uid).flatten().filter(|a| a == AVATAR_B)).await;
-    bob.wait("alice 的头像", |seen| avatar_in(seen, &alice_uid).flatten().filter(|a| a == AVATAR_A1)).await;
+    // 个人资料：加好友后两边各往私聊传一份加密头像、发一条个人资料，对方收到 people 事件带头像键，按键读出的就是对方交来的
+    // 那张。服务器上（库和文件）找不到头像的明文。
+    let bob_key = alice.wait("bob 的头像", |seen| avatar_in(seen, &bob_uid).flatten()).await;
+    assert!(bob_key.starts_with("fim-photo:v1:"), "{bob_key}");
+    assert_eq!(read_avatar(&alice, &bob_key).await, bob_photo);
+    let alice_key = bob.wait("alice 的头像", |seen| avatar_in(seen, &alice_uid).flatten()).await;
+    assert_eq!(read_avatar(&bob, &alice_key).await, alice_photo);
     let members = bob.call("people/get", json!({ "ids": [alice_uid] })).await.unwrap();
-    assert_eq!(members["found"][0]["avatar"], AVATAR_A1);
-    let stored = std::fs::read(env.server.dir.path().join("friend-im.sqlite3")).unwrap();
-    let wal = std::fs::read(env.server.dir.path().join("friend-im.sqlite3-wal")).unwrap_or_default();
-    for bytes in [&stored, &wal] {
-        assert!(!bytes.windows(b"avatar.cindy.test".len()).any(|w| w == b"avatar.cindy.test"), "服务器库里有头像地址的明文");
-    }
+    assert_eq!(members["found"][0]["avatar"], alice_key.as_str());
+    assert!(!on_server(&env, PHOTO_MARK.as_bytes()), "服务器上有头像的明文");
     let refused = alice.call("avatars/read", json!({ "key": "https://evil.example.org/x.png", "offset": 0, "length": 1024 })).await;
     assert!(refused.is_err(), "不在名单上的主机不取");
 
@@ -831,14 +884,24 @@ async fn friends_groups_and_profiles_through_plugin_actions() {
     choose(&alice, &flow, "confirm", None, &[]).await;
     ended(&alice, from, &flow, "action/finished").await;
 
-    // 头像换了（凭据里的和发过的不一样）：重新打开时往每个会话再发一次，bob 收到新头像。
-    let mut credential = saved(&alice);
-    assert_eq!(credential.announced.as_ref().and_then(|a| a.avatar.as_deref()), Some(AVATAR_A1), "发完记下了");
-    credential = credential.with_avatar(Some(AVATAR_A2));
+    // 换了头像：重新打开后宿主交来新的一张（和凭据里记着发过的不一样），往每个会话再发一份，bob 收到读得出新图的头像键；
+    // 发完凭据记下新头像的摘要。每个会话传的是各自的一份、头像键不同（群里那份旧头像的键也不同），所以按读出来的图认。
+    let credential = saved(&alice);
+    assert_eq!(credential.announced.as_ref().and_then(|a| a.photo.clone()), Some(sha256_hex(&alice_photo)), "发过的记下了");
     alice.close().await;
     let dir = tempfile::tempdir().unwrap();
     let (again, _) = Host::start(dir.path()).await;
     assert_eq!(again.open(&env.server.url(), Some(&credential.encode()), None).await["state"], "online");
-    bob.wait("alice 的新头像", |seen| avatar_in(seen, &alice_uid).flatten().filter(|a| a == AVATAR_A2)).await;
-    again.wait("记下新头像发过了", |seen| saved_in(seen).filter(|c| c.announced.as_ref().and_then(|a| a.avatar.as_deref()) == Some(AVATAR_A2))).await;
+    let new_photo = photo("alice-2");
+    hand_avatar(&again, &new_photo).await;
+    let mut old_keys = std::collections::HashSet::from([alice_key]);
+    loop {
+        let key = bob.wait("alice 的新头像", |seen| avatar_in(seen, &alice_uid).flatten().filter(|k| !old_keys.contains(k))).await;
+        if read_avatar(&bob, &key).await == new_photo {
+            break;
+        }
+        old_keys.insert(key);
+    }
+    let new_sha = sha256_hex(&new_photo);
+    again.wait("记下新头像发过了", |seen| saved_in(seen).filter(|c| c.announced.as_ref().and_then(|a| a.photo.as_deref()) == Some(new_sha.as_str()))).await;
 }

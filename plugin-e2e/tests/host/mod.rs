@@ -61,10 +61,18 @@ impl Host {
     }
 
     pub async fn start_with(temp_dir: &std::path::Path, options: Options) -> (Self, Value) {
+        Self::start_reading_with(temp_dir, options, false).await
+    }
+
+    pub async fn start_reading(temp_dir: &std::path::Path) -> (Self, Value) {
+        Self::start_reading_with(temp_dir, options(), true).await
+    }
+
+    async fn start_reading_with(temp_dir: &std::path::Path, options: Options, reading_events: bool) -> (Self, Value) {
         let (to_plugin, plugin_in) = tokio::io::duplex(8 << 20);
         let (plugin_out, from_plugin) = tokio::io::duplex(8 << 20);
         tokio::spawn(friend_im::serve(plugin_in, plugin_out, options));
-        Self::connect(Box::new(to_plugin), from_plugin, None, temp_dir).await
+        Self::connect(Box::new(to_plugin), from_plugin, None, temp_dir, reading_events).await
     }
 
     /// 起真的插件程序（子进程，标准输入输出讲协议），握手。
@@ -80,10 +88,10 @@ impl Host {
             .unwrap_or_else(|e| panic!("起不了插件程序 {}：{e}", program.display()));
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        Self::connect(Box::new(stdin), stdout, Some(child), temp_dir).await
+        Self::connect(Box::new(stdin), stdout, Some(child), temp_dir, false).await
     }
 
-    async fn connect(writer: Box<dyn AsyncWrite + Send + Unpin>, reader: impl AsyncRead + Unpin + Send + 'static, child: Option<tokio::process::Child>, temp_dir: &std::path::Path) -> (Self, Value) {
+    async fn connect(writer: Box<dyn AsyncWrite + Send + Unpin>, reader: impl AsyncRead + Unpin + Send + 'static, child: Option<tokio::process::Child>, temp_dir: &std::path::Path, reading_events: bool) -> (Self, Value) {
         let host = Self {
             writer: Arc::new(tokio::sync::Mutex::new(writer)),
             child,
@@ -105,7 +113,7 @@ impl Host {
             .call(
                 "initialize",
                 json!({ "protocolVersions": [1], "host": { "name": "HHH", "version": "test" }, "locale": "zh-CN",
-                        "tempDir": temp_dir.to_string_lossy(), "network": {} }),
+                        "tempDir": temp_dir.to_string_lossy(), "network": {}, "readingEvents": reading_events }),
             )
             .await
             .expect("握手");

@@ -531,11 +531,11 @@ dependencies = [
 
 [[package]]
 name = "friend-im"
-version = "0.4.2"
+version = "0.4.5"
 dependencies = [
  "base64 0.22.1",
  "friend-im-client",
- "hhh-im-protocol 0.10.0",
+ "hhh-im-protocol 0.16.0",
  "imagesize",
  "serde",
  "serde_json",
@@ -767,8 +767,8 @@ dependencies = [
 
 [[package]]
 name = "hhh-im-protocol"
-version = "0.10.0"
-source = "git+https://github.com/MagicLizi/hhh-im-sdk?tag=v0.10.0#8595a48c339a19859df224502f43690f777f526c"
+version = "0.16.0"
+source = "git+https://github.com/MagicLizi/hhh-im-sdk?tag=v0.16.0#620956551c67951f8debcfd9328b65f0bb986894"
 dependencies = [
  "serde",
  "serde_json",

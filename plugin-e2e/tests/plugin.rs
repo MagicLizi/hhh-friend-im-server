@@ -136,6 +136,58 @@ async fn read_history(host: &Host, conv: &ConvId, limit: u16, window: (Option<i6
 // ---------- S14：收发消息、同步、撤回、附件、翻历史、会话列表 ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reading_protocol_keeps_exact_positions_partial_lists_and_notification_negotiation() {
+    let env=Env::start().await;
+    let (alice,alice_key)=env.account("alice","phone").await;
+    let (bob,bob_key)=env.account("bob","phone").await;
+    let (carol,_)=env.account("carol","phone").await;
+    alice.client.add_friend(&bob.client.friend_link(false).await.unwrap()).await.unwrap();
+    alice.client.add_friend(&carol.client.friend_link(false).await.unwrap()).await.unwrap();
+    let group=alice.client.create_group(&GroupProfile::default(),&[bob.client.uid().clone(),carol.client.uid().clone()]).await.unwrap();
+    let alice_credential=plugin_computer(&env,"alice",&alice_key,"plugin").await;
+    let bob_credential=plugin_computer(&env,"bob",&bob_key,"plugin").await;
+    let temp=tempfile::tempdir().unwrap();
+    let (a,init)=Host::start_reading(temp.path()).await;
+    assert_eq!(init["capabilities"]["receipts"]["readers"],true);
+    assert_eq!(init["capabilities"]["receipts"]["unreaders"],true);
+    assert_eq!(a.open(&env.server.url(),Some(&alice_credential),None).await["state"],"online");
+    let (b,_temp)=online(&env,&bob_credential).await;
+    let first=send_text(&a,&group,"阅读边界一").await;
+    let second=send_text(&a,&group,"阅读边界二").await;
+    let scope=json!({"conversationId":group.to_string()});
+    let before=a.call("reading/receipts",json!({"scope":scope,"messageIds":[second.id]})).await.unwrap();
+    assert!(before["items"][0].get("readCount").is_none(),"未报告阅读的人不能当成零人已读");
+    assert!(before["items"][0].get("totalCount").is_none(),"没有事实的人不当未读");
+    let sync=b.call("reading/sync",json!({"scope":scope,"messageIds":[]})).await.unwrap();
+    assert!(sync.get("through").is_none());
+    assert_eq!(b.call("reading/mark",json!({"scope":scope,"messageId":first.id})).await.unwrap()["state"],"applied");
+    let last=alice.client.reading_messages(&group,&[friend_im_client::core::ids::MsgId::parse(&first.id).unwrap()]).await.unwrap().remove(0).log;
+    assert_eq!(b.call("reading/sync",json!({"scope":scope,"messageIds":[]})).await.unwrap()["through"],last.to_string());
+    let second_id=friend_im_client::core::ids::MsgId::parse(&second.id).unwrap();
+    carol.client.mark_read(&group,&second_id,None).await.unwrap();
+    let partial=a.call("reading/receipts",json!({"scope":scope,"messageIds":[second.id]})).await.unwrap();
+    assert_eq!(partial["items"][0]["readCount"],1);
+    assert_eq!(partial["items"][0]["totalCount"],2);
+    let unread=a.call("reading/people",json!({"scope":scope,"messageId":second.id,"read":false,"limit":1})).await.unwrap();
+    assert_eq!(unread["people"][0]["id"],bob.client.uid().as_str());
+    assert_eq!(unread["complete"],true);
+    b.call("reading/mark",json!({"scope":scope,"messageId":second.id})).await.unwrap();
+    let page=a.call("reading/people",json!({"scope":scope,"messageId":second.id,"read":true,"limit":1})).await.unwrap();
+    assert_eq!(page["complete"],false);
+    let next=page["nextCursor"].as_str().unwrap();
+    let end=a.call("reading/people",json!({"scope":scope,"messageId":second.id,"read":true,"limit":1,"cursor":next})).await.unwrap();
+    assert_eq!(end["complete"],true);
+    assert_ne!(page["people"][0]["id"],end["people"][0]["id"]);
+    assert!(a.call("reading/people",json!({"scope":scope,"messageId":first.id,"read":true,"limit":1,"cursor":next})).await.is_err());
+    a.wait("已协商的阅读通知",|seen|seen.iter().any(|s|matches!(s,host::Seen::Note(method,_) if method=="reading/changed")).then_some(())).await;
+    assert!(!b.seen.lock().unwrap().iter().any(|s|matches!(s,host::Seen::Note(method,_) if method=="reading/changed")),"未协商的宿主不会收到新通知");
+    let invalid=b.call("reading/mark",json!({"scope":scope,"messageId":second.id,"position":"0"})).await;
+    assert!(invalid.is_err());
+    a.close().await;
+    b.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn messages_flow_through_plugins() {
     let env = Env::start().await;
     let (mut alice_phone, alice_key) = env.account("alice", "alice 的手机").await;

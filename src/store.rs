@@ -145,6 +145,17 @@ CREATE TABLE IF NOT EXISTS messages(
 CREATE INDEX IF NOT EXISTS messages_conv ON messages(conv, log);
 -- 按时间读历史、会话活动：时间窗口先在这里换成序号范围（v0.2.0 加，老库打开时补建，表结构不变）。
 CREATE INDEX IF NOT EXISTS messages_conv_ts ON messages(conv, ts_ms, log);
+-- 附加表不改变旧表或 schema_version：旧服务器可保留这些密文安全降级。
+CREATE TABLE IF NOT EXISTS reading_states(
+    conv TEXT NOT NULL,
+    reader TEXT NOT NULL,
+    device TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    log INTEGER NOT NULL,
+    envelope TEXT NOT NULL,
+    PRIMARY KEY(conv, reader, device)
+);
+CREATE INDEX IF NOT EXISTS reading_states_page ON reading_states(conv, log);
 CREATE TABLE IF NOT EXISTS files(
     file TEXT PRIMARY KEY,
     uid TEXT NOT NULL,
@@ -182,6 +193,8 @@ pub struct Effects {
 /// 推送的目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
+    /// 仅某账号已协商阅读扩展的连接。
+    ReadingAccount(Uid),
     /// 某账号所有已批准的电脑。
     Account(Uid),
     /// 某账号所有已批准的电脑，跳过已经由局域网提交的电脑。

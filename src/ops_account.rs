@@ -129,6 +129,7 @@ impl Store {
             self.replay_join_answer(&device_id, now, &mut effects)?;
         }
         let welcome = Welcome {
+            reading: true,
             uid: uid.clone(),
             name: account.name,
             epoch: account.epoch,

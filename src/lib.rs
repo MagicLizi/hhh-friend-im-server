@@ -12,6 +12,7 @@ mod ops_account;
 mod ops_conv;
 mod ops_join;
 mod ops_msg;
+mod ops_reading;
 pub mod store;
 mod ws;
 
@@ -29,6 +30,7 @@ use ops_msg::{RateLimiter, Uploads};
 pub struct Locked {
     pub store: store::Store,
     pub(crate) limiter: RateLimiter,
+    pub(crate) reading_limiter: RateLimiter,
     pub(crate) uploads: Uploads,
 }
 
@@ -52,6 +54,7 @@ impl App {
             locked: Mutex::new(Locked {
                 store,
                 limiter: RateLimiter::new(config.send_per_second, config.send_per_minute),
+                reading_limiter: RateLimiter::new(5, 60),
                 uploads: Uploads::default(),
             }),
             hub: hub::Hub::default(),

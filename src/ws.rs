@@ -182,9 +182,11 @@ async fn dispatch(app: &Arc<App>, session: &Session, registration: &Arc<Registra
     app.with_store(move |locked, hub| {
         let id = frame.id;
         let now = now_ms();
+        let reading = matches!(&frame.req, Request::ReadingGet { .. } | Request::ReadingSet { .. });
         let result = run(locked, hub, &session, frame.req, now);
         match result {
             Ok((response, effects)) => {
+                if reading { hub.enable_reading(&registration); }
                 let close_self = hub.apply(&effects, Some(&registration));
                 hub.reply(&registration, ServerFrame::Res { id, res: response });
                 if close_self {
@@ -249,5 +251,8 @@ fn run(locked: &mut Locked, hub: &crate::hub::Hub, s: &Session, req: Request, no
         Request::Activity { since_ms } => store.activity(s, since_ms),
         Request::Sync { since, limit } => store.sync(s, since, limit),
         Request::FileCreate { conv, size } => store.file_create(s, &conv, size, now),
+        Request::ReadingMessages { conv, ids } => store.reading_messages(s, &conv, &ids),
+        Request::ReadingGet { conv, after, limit } => store.reading_get(s, &conv, after, limit),
+        Request::ReadingSet { envelope } => store.reading_set(s, &envelope, &mut locked.reading_limiter, now),
     }
 }

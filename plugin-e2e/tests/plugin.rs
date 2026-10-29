@@ -156,7 +156,7 @@ async fn reading_protocol_keeps_exact_positions_partial_lists_and_notification_n
     let second=send_text(&a,&group,"阅读边界二").await;
     let scope=json!({"conversationId":group.to_string()});
     let before=a.call("reading/receipts",json!({"scope":scope,"messageIds":[second.id]})).await.unwrap();
-    assert_eq!(before["items"][0]["readCount"],0);
+    assert!(before["items"][0].get("readCount").is_none(),"未报告阅读的人不能当成零人已读");
     assert!(before["items"][0].get("totalCount").is_none(),"没有事实的人不当未读");
     let sync=b.call("reading/sync",json!({"scope":scope,"messageIds":[]})).await.unwrap();
     assert!(sync.get("through").is_none());

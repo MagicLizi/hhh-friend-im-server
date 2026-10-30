@@ -38,7 +38,7 @@ async fn smoke_against_a_running_server() {
     let recovery = alice.client.provision().await.unwrap();
     let mut bob = connect("bob", "bob 的电脑").await;
     bob.client.provision().await.unwrap();
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     alice.client.send(&dm, &MsgId::random(), text("容器里的服务器你好")).await.unwrap();
     bob.wait_text("容器里的服务器你好").await;
     let data: Vec<u8> = (0..(3 * 1024 * 1024)).map(|i: u32| (i % 241) as u8).collect();

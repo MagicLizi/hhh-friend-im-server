@@ -35,16 +35,8 @@ async fn exact_boundaries_unknown_readers_and_historical_membership() {
     let (alice, _) = env.account("alice", "pc").await;
     let (mut bob, _) = env.account("bob", "pc").await;
     let (mut carol, _) = env.account("carol", "pc").await;
-    alice
-        .client
-        .add_friend(&bob.client.friend_link(false).await.unwrap())
-        .await
-        .unwrap();
-    alice
-        .client
-        .add_friend(&carol.client.friend_link(false).await.unwrap())
-        .await
-        .unwrap();
+    approved_dm(&alice.client, &bob.client).await;
+    approved_dm(&alice.client, &carol.client).await;
     let group = alice
         .client
         .create_group(
@@ -131,11 +123,7 @@ async fn cross_device_restart_and_cas_preserve_the_latest_boundary() {
     let mut env = Env::start().await;
     let (alice, _) = env.account("alice", "pc").await;
     let (mut bob, _) = env.account("bob", "pc").await;
-    let conv = alice
-        .client
-        .add_friend(&bob.client.friend_link(false).await.unwrap())
-        .await
-        .unwrap();
+    let conv = approved_dm(&alice.client, &bob.client).await;
     let one = send(&alice, &conv, "第一条").await;
     let two = send(&alice, &conv, "第二条").await;
     let third = send(&alice, &conv, "第三条").await;
@@ -298,11 +286,7 @@ async fn reading_rejects_foreign_conversations_and_pending_devices() {
     let (alice, _) = env.account("alice", "pc").await;
     let (mut bob, _) = env.account("bob", "pc").await;
     let (eve, _) = env.account("eve", "pc").await;
-    let conv = alice
-        .client
-        .add_friend(&bob.client.friend_link(false).await.unwrap())
-        .await
-        .unwrap();
+    let conv = approved_dm(&alice.client, &bob.client).await;
     let id = send(&alice, &conv, "不能跨会话").await;
     bob.wait_text("不能跨会话").await;
     assert_eq!(
@@ -327,11 +311,7 @@ async fn reading_rejects_foreign_conversations_and_pending_devices() {
         .code,
         ErrorCode::NotApproved
     );
-    let other = alice
-        .client
-        .add_friend(&eve.client.friend_link(false).await.unwrap())
-        .await
-        .unwrap();
+    let other = approved_dm(&alice.client, &eve.client).await;
     assert!(alice.client.mark_read(&other, &id, None).await.is_err());
     assert!(
         alice

@@ -10,6 +10,7 @@ mod files;
 pub mod hub;
 mod ops_account;
 mod ops_conv;
+mod ops_friends;
 mod ops_join;
 mod ops_msg;
 mod ops_reading;
@@ -43,7 +44,10 @@ pub struct App {
 
 /// 现在的毫秒时间。
 pub fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl App {
@@ -63,10 +67,16 @@ impl App {
     }
 
     /// 在存储锁里跑一段同步代码（放在阻塞线程池里，不占异步线程）。
-    pub(crate) async fn with_store<T: Send + 'static>(self: &Arc<Self>, f: impl FnOnce(&mut Locked, &hub::Hub) -> T + Send + 'static) -> T {
+    pub(crate) async fn with_store<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&mut Locked, &hub::Hub) -> T + Send + 'static,
+    ) -> T {
         let app = self.clone();
         tokio::task::spawn_blocking(move || {
-            let mut locked = app.locked.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut locked = app
+                .locked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             f(&mut locked, &app.hub)
         })
         .await
@@ -79,8 +89,15 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/ws", get(ws::upgrade))
-        .route("/v1/files/{file}", get(files::download).head(files::progress).put(files::upload))
-        .layer(DefaultBodyLimit::max(friend_im_core::limits::UPLOAD_PART_MAX))
+        .route(
+            "/v1/files/{file}",
+            get(files::download)
+                .head(files::progress)
+                .put(files::upload),
+        )
+        .layer(DefaultBodyLimit::max(
+            friend_im_core::limits::UPLOAD_PART_MAX,
+        ))
         .with_state(app)
 }
 
@@ -94,6 +111,12 @@ pub fn spawn_maintenance(app: Arc<App>) {
             rounds += 1;
             let cleanup = rounds.is_multiple_of(240);
             app.with_store(move |locked, hub| {
+                match locked.store.expire_friend_requests(now_ms()) {
+                    Ok(effects) => {
+                        hub.apply(&effects, None);
+                    }
+                    Err(error) => tracing::warn!(%error, "好友申请过期处理失败"),
+                }
                 match locked.store.expire_joins(now_ms()) {
                     Ok(effects) => {
                         hub.apply(&effects, None);

@@ -542,3 +542,18 @@ impl Raw {
         }
     }
 }
+
+/// Test setup establishes friendships through the same explicit approval as the UI.
+pub async fn approved_dm(sender: &Client, recipient: &Client) -> friend_im_client::core::ids::ConvId {
+    let link=recipient.friend_link(false).await.unwrap();
+    approved_link(sender,recipient,&link).await
+}
+pub async fn approved_link(sender: &Client, recipient: &Client, link:&friend_im_client::FriendLink) -> friend_im_client::core::ids::ConvId {
+    match sender.add_friend(link).await {
+        Ok(existing)=>return existing,
+        Err(e)=>assert_eq!(e.code(),Some(wire::ErrorCode::Forbidden)),
+    }
+    let id=friend_im_client::core::ids::RequestId::random();
+    sender.request_link_friend(&id,link,"").await.unwrap();
+    recipient.accept_friend(&id).await.unwrap().record.conversation.unwrap()
+}

@@ -23,7 +23,7 @@ async fn new_computer_catches_up_ten_thousand_messages() {
     .await;
     let (mut alice, recovery) = env.account("alice", "台式机").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
 
     // 两台都在线时的单条延迟：点发送到对方收到。
     let mut worst = Duration::ZERO;

@@ -25,6 +25,7 @@ struct Conn {
     id: u64,
     approved: bool,
     reading: bool,
+    friends: bool,
     tx: mpsc::Sender<Outbound>,
     kill: Arc<Notify>,
 }
@@ -60,12 +61,34 @@ impl Conn {
 
 impl Hub {
     /// 登记一条连接。
-    pub fn register(&self, uid: &Uid, device: &DeviceId, approved: bool, tx: mpsc::Sender<Outbound>, kill: Arc<Notify>) -> Registration {
+    pub fn register(
+        &self,
+        uid: &Uid,
+        device: &DeviceId,
+        approved: bool,
+        tx: mpsc::Sender<Outbound>,
+        kill: Arc<Notify>,
+    ) -> Registration {
         let mut inner = self.inner.lock().expect("登记处锁");
         inner.next_id += 1;
         let id = inner.next_id;
-        inner.by_device.entry(device.clone()).or_default().push(Conn { id, approved, reading: false, tx, kill });
-        inner.by_uid.entry(uid.clone()).or_default().insert(device.clone());
+        inner
+            .by_device
+            .entry(device.clone())
+            .or_default()
+            .push(Conn {
+                id,
+                approved,
+                reading: false,
+                friends: false,
+                tx,
+                kill,
+            });
+        inner
+            .by_uid
+            .entry(uid.clone())
+            .or_default()
+            .insert(device.clone());
         Registration {
             id,
             device: device.clone(),
@@ -76,8 +99,23 @@ impl Hub {
     /// 当前连接明确使用扩展后才订阅，旧客户端不会收到它不认识的帧。
     pub fn enable_reading(&self, registration: &Registration) {
         let mut inner = self.inner.lock().expect("登记处锁");
-        if let Some(conn) = inner.by_device.get_mut(&registration.device).and_then(|conns| conns.iter_mut().find(|c| c.id == registration.id)) {
+        if let Some(conn) = inner
+            .by_device
+            .get_mut(&registration.device)
+            .and_then(|conns| conns.iter_mut().find(|c| c.id == registration.id))
+        {
             conn.reading = true;
+        }
+    }
+
+    pub fn enable_friends(&self, registration: &Registration) {
+        let mut inner = self.inner.lock().expect("登记处锁");
+        if let Some(conn) = inner
+            .by_device
+            .get_mut(&registration.device)
+            .and_then(|conns| conns.iter_mut().find(|c| c.id == registration.id))
+        {
+            conn.friends = true;
         }
     }
 
@@ -104,13 +142,21 @@ impl Hub {
 
     /// 这台电脑现在是否在线。
     pub fn is_online(&self, device: &DeviceId) -> bool {
-        self.inner.lock().expect("登记处锁").by_device.contains_key(device)
+        self.inner
+            .lock()
+            .expect("登记处锁")
+            .by_device
+            .contains_key(device)
     }
 
     /// 给某条连接发一帧（回执）。
     pub fn reply(&self, registration: &Registration, frame: ServerFrame) {
         let inner = self.inner.lock().expect("登记处锁");
-        if let Some(conn) = inner.by_device.get(&registration.device).and_then(|c| c.iter().find(|c| c.id == registration.id)) {
+        if let Some(conn) = inner
+            .by_device
+            .get(&registration.device)
+            .and_then(|c| c.iter().find(|c| c.id == registration.id))
+        {
             conn.send(Outbound::Frame(Box::new(frame)));
         }
     }
@@ -118,7 +164,11 @@ impl Hub {
     /// 关闭某条连接（排在已入队的帧后面）。
     pub fn close(&self, registration: &Registration) {
         let inner = self.inner.lock().expect("登记处锁");
-        if let Some(conn) = inner.by_device.get(&registration.device).and_then(|c| c.iter().find(|c| c.id == registration.id)) {
+        if let Some(conn) = inner
+            .by_device
+            .get(&registration.device)
+            .and_then(|c| c.iter().find(|c| c.id == registration.id))
+        {
             conn.send(Outbound::Close);
         }
     }
@@ -135,25 +185,46 @@ impl Hub {
         }
         for (target, push) in &effects.pushes {
             match target {
-                Target::Account(uid) | Target::AccountExcept(uid, _) | Target::ReadingAccount(uid) => {
-                    let Some(devices) = inner.by_uid.get(uid) else { continue };
+                Target::Account(uid)
+                | Target::AccountExcept(uid, _)
+                | Target::ReadingAccount(uid)
+                | Target::FriendAccount(uid) => {
+                    let Some(devices) = inner.by_uid.get(uid) else {
+                        continue;
+                    };
                     let skipped = match target {
                         Target::AccountExcept(_, devices) => Some(devices),
-                        Target::Account(_) | Target::ReadingAccount(_) => None,
+                        Target::Account(_)
+                        | Target::ReadingAccount(_)
+                        | Target::FriendAccount(_) => None,
                         Target::Device(_) => unreachable!(),
                     };
                     for device in devices {
                         if skipped.is_some_and(|list| list.iter().any(|skip| skip == device)) {
                             continue;
                         }
-                        for conn in inner.by_device.get(device).into_iter().flatten().filter(|c| c.approved && (!matches!(target, Target::ReadingAccount(_)) || c.reading)) {
-                            conn.send(Outbound::Frame(Box::new(ServerFrame::Push { push: push.clone() })));
+                        for conn in inner
+                            .by_device
+                            .get(device)
+                            .into_iter()
+                            .flatten()
+                            .filter(|c| {
+                                c.approved
+                                    && (!matches!(target, Target::ReadingAccount(_)) || c.reading)
+                                    && (!matches!(target, Target::FriendAccount(_)) || c.friends)
+                            })
+                        {
+                            conn.send(Outbound::Frame(Box::new(ServerFrame::Push {
+                                push: push.clone(),
+                            })));
                         }
                     }
                 }
                 Target::Device(device) => {
                     for conn in inner.by_device.get(device).into_iter().flatten() {
-                        conn.send(Outbound::Frame(Box::new(ServerFrame::Push { push: push.clone() })));
+                        conn.send(Outbound::Frame(Box::new(ServerFrame::Push {
+                            push: push.clone(),
+                        })));
                     }
                 }
             }
@@ -202,11 +273,16 @@ mod tests {
         assert!(rx_b.try_recv().is_err(), "没批准的电脑收不到账号推送");
         // b 的队列只有 1 格：塞两条直发，第二条触发断开。
         let effects = Effects {
-            pushes: vec![(Target::Device(b.clone()), Push::DeviceRemoved), (Target::Device(b.clone()), Push::DeviceRemoved)],
+            pushes: vec![
+                (Target::Device(b.clone()), Push::DeviceRemoved),
+                (Target::Device(b.clone()), Push::DeviceRemoved),
+            ],
             ..Default::default()
         };
         hub.apply(&effects, None);
-        tokio::time::timeout(std::time::Duration::from_secs(1), kill_b.notified()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), kill_b.notified())
+            .await
+            .unwrap();
         hub.unregister(&reg_a);
         assert!(!hub.is_online(&a));
         assert!(hub.is_online(&b));
@@ -222,7 +298,10 @@ mod tests {
         let _reg_a = hub.register(&uid, &a, true, tx_a, Arc::new(Notify::new()));
         let _reg_b = hub.register(&uid, &b, true, tx_b, Arc::new(Notify::new()));
         hub.apply(
-            &Effects { pushes: vec![(Target::AccountExcept(uid, vec![b]), Push::DeviceRemoved)], ..Default::default() },
+            &Effects {
+                pushes: vec![(Target::AccountExcept(uid, vec![b]), Push::DeviceRemoved)],
+                ..Default::default()
+            },
             None,
         );
         assert!(matches!(rx_a.try_recv(), Ok(Outbound::Frame(_))));
@@ -239,10 +318,27 @@ mod tests {
         let (tx_pending, mut pending) = mpsc::channel(2);
         let _old = hub.register(&uid, &device, true, tx_old, Arc::new(Notify::new()));
         let current = hub.register(&uid, &device, true, tx_new, Arc::new(Notify::new()));
-        let unapproved = hub.register(&uid, &DeviceId::random(), false, tx_pending, Arc::new(Notify::new()));
+        let unapproved = hub.register(
+            &uid,
+            &DeviceId::random(),
+            false,
+            tx_pending,
+            Arc::new(Notify::new()),
+        );
         hub.enable_reading(&current);
         hub.enable_reading(&unapproved);
-        hub.apply(&Effects { pushes: vec![(Target::ReadingAccount(uid), Push::ReadingChanged { conv: friend_im_core::ids::ConvId::random() })], ..Default::default() }, None);
+        hub.apply(
+            &Effects {
+                pushes: vec![(
+                    Target::ReadingAccount(uid),
+                    Push::ReadingChanged {
+                        conv: friend_im_core::ids::ConvId::random(),
+                    },
+                )],
+                ..Default::default()
+            },
+            None,
+        );
         assert!(matches!(new.try_recv(), Ok(Outbound::Frame(_))));
         assert!(old.try_recv().is_err(), "同一设备的旧连接也不能收到新帧");
         assert!(pending.try_recv().is_err(), "订阅不绕过批准");

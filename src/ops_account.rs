@@ -9,13 +9,15 @@ use friend_im_core::ids::{DeviceId, Uid};
 use friend_im_core::keys::DevicePublic;
 use friend_im_core::limits;
 use friend_im_core::wire::{
-    AccountEntry, AccountInfo, AccountKeyBundle, DeviceInfo, DeviceKind, DeviceStatus, ErrorCode, Event, GenerationBox, GenerationWrap, Push, Response, SyncEvent,
-    Welcome, WireError,
+    AccountEntry, AccountInfo, AccountKeyBundle, DeviceInfo, DeviceKind, DeviceStatus, ErrorCode,
+    Event, GenerationBox, GenerationWrap, Push, Response, SyncEvent, Welcome, WireError,
 };
 use rusqlite::{OptionalExtension, params};
 
 use crate::cindy::CindyIdentity;
-use crate::store::{DbResult, DeviceRow, DeviceState, Effects, Store, Target, fail, from_json, internal, to_json};
+use crate::store::{
+    DbResult, DeviceRow, DeviceState, Effects, Store, Target, fail, from_json, internal, to_json,
+};
 
 /// 一条连接登录后的身份。
 #[derive(Clone, Debug)]
@@ -46,9 +48,17 @@ pub(crate) fn session_hash(token: &[u8]) -> [u8; 32] {
 
 impl Store {
     /// 登录：Cindy 凭证（第一次）或登录凭证。返回会话身份、回执与要补发的推送。
-    pub fn login(&mut self, auth: LoginAuth, keys: DevicePublic, name: &str, kind: DeviceKind, now: i64) -> Result<(Session, Welcome, Effects), WireError> {
+    pub fn login(
+        &mut self,
+        auth: LoginAuth,
+        keys: DevicePublic,
+        name: &str,
+        kind: DeviceKind,
+        now: i64,
+    ) -> Result<(Session, Welcome, Effects), WireError> {
         check_device_name(name).map_err(|e| fail(ErrorCode::BadRequest, e.to_string()))?;
-        keys.check().map_err(|e| fail(ErrorCode::BadRequest, e.to_string()))?;
+        keys.check()
+            .map_err(|e| fail(ErrorCode::BadRequest, e.to_string()))?;
         let device_id = keys.id();
         let mut effects = Effects::default();
         let (uid, session_token) = match auth {
@@ -61,15 +71,24 @@ impl Store {
                 )
                 .db()?;
                 match self.device(&device_id)? {
-                    Some(row) if row.uid != uid => return Err(fail(ErrorCode::Forbidden, "这台电脑属于另一个账号")),
+                    Some(row) if row.uid != uid => {
+                        return Err(fail(ErrorCode::Forbidden, "这台电脑属于另一个账号"));
+                    }
                     Some(row) if row.state == DeviceState::Removed => {
-                        return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号，需要重新生成电脑钥匙"));
+                        return Err(fail(
+                            ErrorCode::DeviceRemoved,
+                            "这台电脑已被移出账号，需要重新生成电脑钥匙",
+                        ));
                     }
                     Some(_) => {}
                     None => {
                         let pending = self.devices_of(&uid, DeviceState::Pending)?;
                         if pending.len() >= PENDING_DEVICES_MAX {
-                            tx.execute("DELETE FROM devices WHERE device = ?1", params![pending[0].device.as_str()]).db()?;
+                            tx.execute(
+                                "DELETE FROM devices WHERE device = ?1",
+                                params![pending[0].device.as_str()],
+                            )
+                            .db()?;
                             tracing::info!(uid = %uid, "未批准的电脑太多，删掉最早的一台");
                         }
                         tx.execute(
@@ -91,14 +110,19 @@ impl Store {
             LoginAuth::Session(hash) => {
                 let found: Option<(String, String)> = self
                     .conn
-                    .query_row("SELECT device, uid FROM devices WHERE session_hash = ?1", params![hash.to_vec()], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
+                    .query_row(
+                        "SELECT device, uid FROM devices WHERE session_hash = ?1",
+                        params![hash.to_vec()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
                     .optional()
                     .db()?;
                 let Some((device, uid)) = found else {
                     // 移出时登录凭证已清掉；握手已用电脑钥匙签过名，是这台电脑本人，照实告诉它被移出了。
-                    if self.device(&device_id)?.is_some_and(|row| row.state == DeviceState::Removed) {
+                    if self
+                        .device(&device_id)?
+                        .is_some_and(|row| row.state == DeviceState::Removed)
+                    {
                         return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号"));
                     }
                     return Err(fail(ErrorCode::Unauthorized, "登录凭证无效，请重新登录"));
@@ -107,18 +131,30 @@ impl Store {
                     return Err(fail(ErrorCode::Unauthorized, "登录凭证不属于这台电脑"));
                 }
                 self.conn
-                    .execute("UPDATE devices SET last_seen_ms = ?1 WHERE device = ?2", params![now, device])
+                    .execute(
+                        "UPDATE devices SET last_seen_ms = ?1 WHERE device = ?2",
+                        params![now, device],
+                    )
                     .db()?;
                 (Uid::parse(&uid).map_err(internal)?, None)
             }
         };
         self.conn
-            .execute("UPDATE devices SET kind = ?1 WHERE device = ?2", params![kind.as_str(), device_id.as_str()])
+            .execute(
+                "UPDATE devices SET kind = ?1 WHERE device = ?2",
+                params![kind.as_str(), device_id.as_str()],
+            )
             .db()?;
-        let account = self.account(&uid)?.ok_or_else(|| internal("登录后找不到账号"))?;
-        let row = self.device(&device_id)?.ok_or_else(|| internal("登录后找不到电脑"))?;
+        let account = self
+            .account(&uid)?
+            .ok_or_else(|| internal("登录后找不到账号"))?;
+        let row = self
+            .device(&device_id)?
+            .ok_or_else(|| internal("登录后找不到电脑"))?;
         let status = match (account.provisioned, row.state) {
-            (_, DeviceState::Removed) => return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号")),
+            (_, DeviceState::Removed) => {
+                return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号"));
+            }
             (false, _) => DeviceStatus::Unprovisioned,
             (true, DeviceState::Pending) => DeviceStatus::Pending,
             (true, DeviceState::Active) => DeviceStatus::Active,
@@ -129,6 +165,7 @@ impl Store {
             self.replay_join_answer(&device_id, now, &mut effects)?;
         }
         let welcome = Welcome {
+            friend_requests: true,
             reading: true,
             uid: uid.clone(),
             name: account.name,
@@ -139,12 +176,21 @@ impl Store {
             rotation_needed: account.rotation_needed,
             sync_head: self.last_log,
         };
-        Ok((Session { uid, device: device_id }, welcome, effects))
+        Ok((
+            Session {
+                uid,
+                device: device_id,
+            },
+            welcome,
+            effects,
+        ))
     }
 
     /// 要求这台电脑已批准；返回它的记录。
     pub(crate) fn require_active(&self, s: &Session) -> Result<DeviceRow, WireError> {
-        let row = self.device(&s.device)?.ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
+        let row = self
+            .device(&s.device)?
+            .ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
         match row.state {
             DeviceState::Active => Ok(row),
             DeviceState::Pending => Err(fail(ErrorCode::NotApproved, "这台电脑还没被批准")),
@@ -153,7 +199,9 @@ impl Store {
     }
 
     pub(crate) fn require_pending(&self, s: &Session) -> Result<DeviceRow, WireError> {
-        let row = self.device(&s.device)?.ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
+        let row = self
+            .device(&s.device)?
+            .ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
         match row.state {
             DeviceState::Pending => Ok(row),
             DeviceState::Active => Err(fail(ErrorCode::Conflict, "这台电脑已经批准过了")),
@@ -162,7 +210,12 @@ impl Store {
     }
 
     /// 核对一份账号钥匙封装：代数对、收件人正好是期望的那几把钥匙、每把一份。
-    pub(crate) fn check_account_bundle(bundle: &AccountKeyBundle, generation: u32, expected: &BTreeSet<DeviceId>, need_prev: bool) -> Result<(), WireError> {
+    pub(crate) fn check_account_bundle(
+        bundle: &AccountKeyBundle,
+        generation: u32,
+        expected: &BTreeSet<DeviceId>,
+        need_prev: bool,
+    ) -> Result<(), WireError> {
         if bundle.generation != generation {
             return Err(fail(ErrorCode::Invalid, "账号钥匙封装的代数不对"));
         }
@@ -173,13 +226,19 @@ impl Store {
         if bundle.boxes.iter().any(|b| b.sealed.ct.len() > 128) {
             return Err(fail(ErrorCode::Invalid, "账号钥匙封装太大"));
         }
-        if need_prev != bundle.prev.is_some() || bundle.prev.as_ref().is_some_and(|p| p.len() > 128) {
+        if need_prev != bundle.prev.is_some() || bundle.prev.as_ref().is_some_and(|p| p.len() > 128)
+        {
             return Err(fail(ErrorCode::Invalid, "旧钥匙链不对"));
         }
         Ok(())
     }
 
-    pub(crate) fn write_account_bundle(conn: &rusqlite::Connection, uid: &Uid, epoch: u32, bundle: &AccountKeyBundle) -> Result<(), WireError> {
+    pub(crate) fn write_account_bundle(
+        conn: &rusqlite::Connection,
+        uid: &Uid,
+        epoch: u32,
+        bundle: &AccountKeyBundle,
+    ) -> Result<(), WireError> {
         for b in &bundle.boxes {
             conn.execute(
                 "INSERT OR REPLACE INTO account_keys(uid, epoch, generation, device, sealed) VALUES(?1, ?2, ?3, ?4, ?5)",
@@ -199,7 +258,16 @@ impl Store {
 
     /// 写一环账号签名链：链表、日志、扇出给本人和聊过的人；返回日志序号与同步事件。
     #[allow(clippy::too_many_arguments)] // 一环签名链落库要的全部信息，拆成结构体反而更难读
-    pub(crate) fn write_account_link(&self, conn: &rusqlite::Connection, uid: &Uid, epoch: u32, seq: u64, link: &AccountLink, now: i64, recipients: &[Uid]) -> Result<SyncEvent, WireError> {
+    pub(crate) fn write_account_link(
+        &self,
+        conn: &rusqlite::Connection,
+        uid: &Uid,
+        epoch: u32,
+        seq: u64,
+        link: &AccountLink,
+        now: i64,
+        recipients: &[Uid],
+    ) -> Result<SyncEvent, WireError> {
         let event = Event::AccountLink {
             uid: uid.clone(),
             epoch,
@@ -208,40 +276,77 @@ impl Store {
         let log = Self::append_log(conn, now, "account_link", Some(&to_json(&event)?))?;
         conn.execute(
             "INSERT INTO account_links(uid, epoch, seq, link, log) VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![uid.as_str(), epoch as i64, seq as i64, to_json(link)?, log as i64],
+            params![
+                uid.as_str(),
+                epoch as i64,
+                seq as i64,
+                to_json(link)?,
+                log as i64
+            ],
         )
         .db()?;
         Self::fan_out(conn, log, recipients)?;
-        Ok(SyncEvent { log, ts_ms: now, event })
+        Ok(SyncEvent {
+            log,
+            ts_ms: now,
+            event,
+        })
     }
 
     /// 开通：第一台电脑提交第一环和账号钥匙第一代。
-    pub fn provision(&mut self, s: &Session, eldest: &AccountLink, keys: &AccountKeyBundle, now: i64) -> OpResult {
-        let account = self.account(&s.uid)?.ok_or_else(|| internal("找不到账号"))?;
+    pub fn provision(
+        &mut self,
+        s: &Session,
+        eldest: &AccountLink,
+        keys: &AccountKeyBundle,
+        now: i64,
+    ) -> OpResult {
+        let account = self
+            .account(&s.uid)?
+            .ok_or_else(|| internal("找不到账号"))?;
         if account.provisioned {
             return Err(fail(ErrorCode::Conflict, "账号已经开通过了"));
         }
         self.require_pending(s)?;
         let log = self.last_log + 1;
-        let state = AccountState::eldest(&s.uid, account.epoch, eldest, log).map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
+        let state = AccountState::eldest(&s.uid, account.epoch, eldest, log)
+            .map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
         if !state.is_active(&s.device) {
             return Err(fail(ErrorCode::Invalid, "第一环里的电脑必须是这台电脑"));
         }
         let expected: BTreeSet<DeviceId> = [s.device.clone(), state.recovery.id()].into();
         Self::check_account_bundle(keys, 1, &expected, false)?;
         let tx = self.conn.unchecked_transaction().db()?;
-        let event = self.write_account_link(&tx, &s.uid, account.epoch, 1, eldest, now, std::slice::from_ref(&s.uid))?;
+        let event = self.write_account_link(
+            &tx,
+            &s.uid,
+            account.epoch,
+            1,
+            eldest,
+            now,
+            std::slice::from_ref(&s.uid),
+        )?;
         if event.log != log {
             return Err(internal("日志序号与预期不符"));
         }
         Self::write_account_bundle(&tx, &s.uid, account.epoch, keys)?;
-        tx.execute("UPDATE accounts SET provisioned = 1, rotation_needed = 0 WHERE uid = ?1", params![s.uid.as_str()])
-            .db()?;
-        tx.execute("UPDATE devices SET status = 'active', joined_ms = ?1 WHERE device = ?2", params![now, s.device.as_str()])
-            .db()?;
+        tx.execute(
+            "UPDATE accounts SET provisioned = 1, rotation_needed = 0 WHERE uid = ?1",
+            params![s.uid.as_str()],
+        )
+        .db()?;
+        tx.execute(
+            "UPDATE devices SET status = 'active', joined_ms = ?1 WHERE device = ?2",
+            params![now, s.device.as_str()],
+        )
+        .db()?;
         tx.commit().db()?;
         self.last_log = log;
-        self.accounts.entry(s.uid.clone()).or_default().epochs.insert(account.epoch, state);
+        self.accounts
+            .entry(s.uid.clone())
+            .or_default()
+            .epochs
+            .insert(account.epoch, state);
         tracing::info!(uid = %s.uid, log, "账号开通");
         let mut effects = Effects::default();
         effects.approve.push(s.device.clone());
@@ -250,30 +355,45 @@ impl Store {
     }
 
     /// 接账号签名链：移除电脑、换代、换恢复密钥、退出登录。
-    pub fn append_account(&mut self, s: &Session, links: &[AccountLink], keys: Option<&AccountKeyBundle>, now: i64) -> OpResult {
+    pub fn append_account(
+        &mut self,
+        s: &Session,
+        links: &[AccountLink],
+        keys: Option<&AccountKeyBundle>,
+        now: i64,
+    ) -> OpResult {
         self.require_active(s)?;
         if links.is_empty() || links.len() > limits::ACCOUNT_LINKS_PER_REQUEST {
             return Err(fail(ErrorCode::BadRequest, "一次接的环数不对"));
         }
-        let account = self.account(&s.uid)?.ok_or_else(|| internal("找不到账号"))?;
-        let mut state = self.current_state(&s.uid)?.ok_or_else(|| internal("已批准的电脑却没有签名链"))?;
+        let account = self
+            .account(&s.uid)?
+            .ok_or_else(|| internal("找不到账号"))?;
+        let mut state = self
+            .current_state(&s.uid)?
+            .ok_or_else(|| internal("已批准的电脑却没有签名链"))?;
         let before_generation = state.current_key().generation;
         let mut removed = Vec::new();
         for (i, link) in links.iter().enumerate() {
-            let body = link.parse().map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
+            let body = link
+                .parse()
+                .map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
             if matches!(body.change, AccountChange::AddDevice { .. }) {
                 return Err(fail(ErrorCode::BadRequest, "加电脑走批准流程"));
             }
             if let AccountChange::RemoveDevice { device, .. } = &body.change {
                 removed.push(device.clone());
             }
-            state.apply(link, self.last_log + 1 + i as u64).map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
+            state
+                .apply(link, self.last_log + 1 + i as u64)
+                .map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
         }
         let after_generation = state.current_key().generation;
         match (after_generation - before_generation, keys) {
             (0, None) => {}
             (1, Some(bundle)) => {
-                let mut expected: BTreeSet<DeviceId> = state.active_devices().map(|(id, _)| id.clone()).collect();
+                let mut expected: BTreeSet<DeviceId> =
+                    state.active_devices().map(|(id, _)| id.clone()).collect();
                 expected.insert(state.recovery.id());
                 Self::check_account_bundle(bundle, after_generation, &expected, true)?;
             }
@@ -286,7 +406,15 @@ impl Store {
         let tx = self.conn.unchecked_transaction().db()?;
         let mut events = Vec::new();
         for (i, link) in links.iter().enumerate() {
-            events.push(self.write_account_link(&tx, &s.uid, account.epoch, first_seq + i as u64, link, now, &recipients)?);
+            events.push(self.write_account_link(
+                &tx,
+                &s.uid,
+                account.epoch,
+                first_seq + i as u64,
+                link,
+                now,
+                &recipients,
+            )?);
         }
         if let Some(bundle) = keys {
             Self::write_account_bundle(&tx, &s.uid, account.epoch, bundle)?;
@@ -298,8 +426,11 @@ impl Store {
             .db()?;
         }
         for device in &removed {
-            tx.execute("UPDATE devices SET status = 'removed', session_hash = NULL WHERE device = ?1", params![device.as_str()])
-                .db()?;
+            tx.execute(
+                "UPDATE devices SET status = 'removed', session_hash = NULL WHERE device = ?1",
+                params![device.as_str()],
+            )
+            .db()?;
         }
         tx.execute(
             "UPDATE accounts SET rotation_needed = ?1 WHERE uid = ?2",
@@ -309,12 +440,21 @@ impl Store {
         tx.commit().db()?;
         let last = events.last().map(|e| e.log).unwrap_or(self.last_log);
         self.last_log = last;
-        self.accounts.entry(s.uid.clone()).or_default().epochs.insert(account.epoch, state);
+        self.accounts
+            .entry(s.uid.clone())
+            .or_default()
+            .epochs
+            .insert(account.epoch, state);
         tracing::info!(uid = %s.uid, removed = removed.len(), rotated = keys.is_some(), "账号签名链接了 {} 环", links.len());
         let mut effects = Effects::default();
         for event in events {
             for uid in &recipients {
-                effects.push(Target::Account(uid.clone()), Push::Event { event: event.clone() });
+                effects.push(
+                    Target::Account(uid.clone()),
+                    Push::Event {
+                        event: event.clone(),
+                    },
+                );
             }
         }
         for device in removed {
@@ -325,20 +465,34 @@ impl Store {
     }
 
     /// 重置账号（契约 S7）。
-    pub fn reset(&mut self, s: &Session, eldest: &AccountLink, keys: &AccountKeyBundle, now: i64) -> OpResult {
-        let account = self.account(&s.uid)?.ok_or_else(|| internal("找不到账号"))?;
+    pub fn reset(
+        &mut self,
+        s: &Session,
+        eldest: &AccountLink,
+        keys: &AccountKeyBundle,
+        now: i64,
+    ) -> OpResult {
+        let account = self
+            .account(&s.uid)?
+            .ok_or_else(|| internal("找不到账号"))?;
         if !account.provisioned {
             return Err(fail(ErrorCode::Conflict, "账号还没开通，直接开通即可"));
         }
-        let row = self.device(&s.device)?.ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
+        let row = self
+            .device(&s.device)?
+            .ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
         if row.state == DeviceState::Removed {
             return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号"));
         }
         let epoch = account.epoch + 1;
         let log = self.last_log + 1;
-        let state = AccountState::eldest(&s.uid, epoch, eldest, log).map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
+        let state = AccountState::eldest(&s.uid, epoch, eldest, log)
+            .map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
         if !state.is_active(&s.device) {
-            return Err(fail(ErrorCode::Invalid, "新一轮第一环里的电脑必须是这台电脑"));
+            return Err(fail(
+                ErrorCode::Invalid,
+                "新一轮第一环里的电脑必须是这台电脑",
+            ));
         }
         let expected: BTreeSet<DeviceId> = [s.device.clone(), state.recovery.id()].into();
         Self::check_account_bundle(keys, 1, &expected, false)?;
@@ -365,11 +519,17 @@ impl Store {
         )
         .db()?;
         for d in &others {
-            tx.execute("UPDATE devices SET status = 'removed', session_hash = NULL WHERE device = ?1", params![d.device.as_str()])
-                .db()?;
-        }
-        tx.execute("UPDATE devices SET status = 'active', joined_ms = ?1 WHERE device = ?2", params![now, s.device.as_str()])
+            tx.execute(
+                "UPDATE devices SET status = 'removed', session_hash = NULL WHERE device = ?1",
+                params![d.device.as_str()],
+            )
             .db()?;
+        }
+        tx.execute(
+            "UPDATE devices SET status = 'active', joined_ms = ?1 WHERE device = ?2",
+            params![now, s.device.as_str()],
+        )
+        .db()?;
         // 自动退出所有群；私聊保留，等任一方用新钥匙接上。
         tx.execute(
             "UPDATE conv_members SET left_log = ?1 WHERE uid = ?2 AND left_log IS NULL AND conv IN (SELECT conv FROM convs WHERE kind = 'group')",
@@ -381,14 +541,27 @@ impl Store {
             params![s.uid.as_str()],
         )
         .db()?;
-        tx.execute("UPDATE joins SET open = 0 WHERE uid = ?1 AND open = 1", params![s.uid.as_str()]).db()?;
+        tx.execute(
+            "UPDATE joins SET open = 0 WHERE uid = ?1 AND open = 1",
+            params![s.uid.as_str()],
+        )
+        .db()?;
         tx.commit().db()?;
         self.last_log = log;
-        self.accounts.entry(s.uid.clone()).or_default().epochs.insert(epoch, state);
+        self.accounts
+            .entry(s.uid.clone())
+            .or_default()
+            .epochs
+            .insert(epoch, state);
         tracing::info!(uid = %s.uid, epoch, "账号重置");
         let mut effects = Effects::default();
         for uid in &recipients {
-            effects.push(Target::Account(uid.clone()), Push::Event { event: event.clone() });
+            effects.push(
+                Target::Account(uid.clone()),
+                Push::Event {
+                    event: event.clone(),
+                },
+            );
         }
         for request in open_joins {
             effects.push(
@@ -410,18 +583,26 @@ impl Store {
     /// 取封装给这台电脑的账号钥匙（当前一轮）和旧钥匙链。
     pub fn get_account_keys(&mut self, s: &Session) -> OpResult {
         self.require_active(s)?;
-        let account = self.account(&s.uid)?.ok_or_else(|| internal("找不到账号"))?;
+        let account = self
+            .account(&s.uid)?
+            .ok_or_else(|| internal("找不到账号"))?;
         self.account_keys_for(&s.uid, account.epoch, &s.device)
     }
 
     /// 新电脑用恢复密钥加入前：取封装给当前恢复密钥的账号钥匙。只有恢复密钥打得开，给还没批准的电脑也不泄露什么。
     pub fn get_recovery_keys(&mut self, s: &Session) -> OpResult {
-        let row = self.device(&s.device)?.ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
+        let row = self
+            .device(&s.device)?
+            .ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
         if row.state == DeviceState::Removed {
             return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号"));
         }
-        let account = self.account(&s.uid)?.ok_or_else(|| internal("找不到账号"))?;
-        let state = self.current_state(&s.uid)?.ok_or_else(|| fail(ErrorCode::Conflict, "账号还没开通"))?;
+        let account = self
+            .account(&s.uid)?
+            .ok_or_else(|| internal("找不到账号"))?;
+        let state = self
+            .current_state(&s.uid)?
+            .ok_or_else(|| fail(ErrorCode::Conflict, "账号还没开通"))?;
         self.account_keys_for(&s.uid, account.epoch, &state.recovery.id())
     }
 
@@ -432,7 +613,9 @@ impl Store {
                 .prepare_cached("SELECT generation, sealed FROM account_keys WHERE uid = ?1 AND epoch = ?2 AND device = ?3 ORDER BY generation")
                 .db()?;
             let rows = stmt
-                .query_map(params![uid.as_str(), epoch as i64, device.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .query_map(params![uid.as_str(), epoch as i64, device.as_str()], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
                 .db()?;
             let mut out = Vec::new();
             for row in rows {
@@ -445,7 +628,10 @@ impl Store {
             out
         };
         let prev = self.account_prev(uid, epoch)?;
-        Ok((Response::AccountKeys { epoch, boxes, prev }, Effects::default()))
+        Ok((
+            Response::AccountKeys { epoch, boxes, prev },
+            Effects::default(),
+        ))
     }
 
     fn account_prev(&self, uid: &Uid, epoch: u32) -> Result<Vec<GenerationWrap>, WireError> {
@@ -465,15 +651,27 @@ impl Store {
     }
 
     /// 取某账号的签名链。还没批准的电脑只能取自己账号的。
-    pub fn get_chain(&mut self, s: &Session, uid: &Uid, epoch: Option<u32>, after: u64) -> OpResult {
-        let row = self.device(&s.device)?.ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
+    pub fn get_chain(
+        &mut self,
+        s: &Session,
+        uid: &Uid,
+        epoch: Option<u32>,
+        after: u64,
+    ) -> OpResult {
+        let row = self
+            .device(&s.device)?
+            .ok_or_else(|| fail(ErrorCode::Unauthorized, "找不到这台电脑"))?;
         match row.state {
             DeviceState::Active => {}
             DeviceState::Pending if uid == &s.uid => {}
             DeviceState::Pending => return Err(fail(ErrorCode::NotApproved, "这台电脑还没被批准")),
-            DeviceState::Removed => return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号")),
+            DeviceState::Removed => {
+                return Err(fail(ErrorCode::DeviceRemoved, "这台电脑已被移出账号"));
+            }
         }
-        let account = self.account(uid)?.ok_or_else(|| fail(ErrorCode::NotFound, "没有这个账号"))?;
+        let account = self
+            .account(uid)?
+            .ok_or_else(|| fail(ErrorCode::NotFound, "没有这个账号"))?;
         let epoch = epoch.unwrap_or(account.epoch);
         if epoch > account.epoch {
             return Err(fail(ErrorCode::NotFound, "没有这一轮"));
@@ -483,7 +681,9 @@ impl Store {
             .prepare_cached("SELECT link, log FROM account_links WHERE uid = ?1 AND epoch = ?2 AND seq > ?3 ORDER BY seq")
             .db()?;
         let rows = stmt
-            .query_map(params![uid.as_str(), epoch as i64, after as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .query_map(params![uid.as_str(), epoch as i64, after as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .db()?;
         let mut entries = Vec::new();
         for row in rows {
@@ -512,7 +712,11 @@ impl Store {
     }
 
     /// 一个账号已加入的电脑：名字、时间、此刻在不在线（“我的电脑”，新电脑请求批准时也交回这一份）。
-    pub(crate) fn device_infos(&self, uid: &Uid, online: &dyn Fn(&DeviceId) -> bool) -> Result<Vec<DeviceInfo>, WireError> {
+    pub(crate) fn device_infos(
+        &self,
+        uid: &Uid,
+        online: &dyn Fn(&DeviceId) -> bool,
+    ) -> Result<Vec<DeviceInfo>, WireError> {
         Ok(self
             .devices_of(uid, DeviceState::Active)?
             .into_iter()
@@ -532,19 +736,31 @@ impl Store {
         self.require_active(s)?;
         let current: Option<Vec<u8>> = self
             .conn
-            .query_row("SELECT friend_token FROM accounts WHERE uid = ?1", params![s.uid.as_str()], |r| r.get(0))
+            .query_row(
+                "SELECT friend_token FROM accounts WHERE uid = ?1",
+                params![s.uid.as_str()],
+                |r| r.get(0),
+            )
             .db()?;
         let token = match current {
             Some(token) if !rotate => token,
             _ => {
                 let token = crypto::random::<16>().to_vec();
                 self.conn
-                    .execute("UPDATE accounts SET friend_token = ?1 WHERE uid = ?2", params![token, s.uid.as_str()])
+                    .execute(
+                        "UPDATE accounts SET friend_token = ?1 WHERE uid = ?2",
+                        params![token, s.uid.as_str()],
+                    )
                     .db()?;
                 token
             }
         };
-        Ok((Response::FriendLink { token: Bytes(token) }, Effects::default()))
+        Ok((
+            Response::FriendLink {
+                token: Bytes(token),
+            },
+            Effects::default(),
+        ))
     }
 
     fn account_info(&mut self, uid: &Uid) -> Result<Option<AccountInfo>, WireError> {
@@ -568,7 +784,11 @@ impl Store {
         }
         let uid: Option<String> = self
             .conn
-            .query_row("SELECT uid FROM accounts WHERE friend_token = ?1", params![token.0.clone()], |r| r.get(0))
+            .query_row(
+                "SELECT uid FROM accounts WHERE friend_token = ?1",
+                params![token.0.clone()],
+                |r| r.get(0),
+            )
             .optional()
             .db()?;
         let uid = uid.ok_or_else(|| fail(ErrorCode::NotFound, "好友链接无效或已失效"))?;
@@ -576,7 +796,12 @@ impl Store {
             .account_info(&Uid::parse(&uid).map_err(internal)?)?
             .filter(|i| i.eldest.is_some())
             .ok_or_else(|| fail(ErrorCode::NotFound, "好友链接无效或已失效"))?;
-        Ok((Response::Profiles { profiles: vec![info] }, Effects::default()))
+        Ok((
+            Response::Profiles {
+                profiles: vec![info],
+            },
+            Effects::default(),
+        ))
     }
 
     /// 查一批账号的名字与身份指纹。

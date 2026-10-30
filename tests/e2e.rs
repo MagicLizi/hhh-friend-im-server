@@ -101,7 +101,7 @@ async fn first_computer_provisions_and_second_joins_with_four_words() {
 
     // 先和 bob 聊几条，后面看新电脑能不能补齐历史。
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&pc1.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &pc1.client).await;
     for i in 1..=3 {
         send(&pc1, &dm, &format!("加电脑前的第 {i} 条")).await;
     }
@@ -209,7 +209,7 @@ async fn recovery_key_joins_replacement_kills_old_key_and_logout_removes_compute
     let env = Env::start().await;
     let (mut pc1, recovery) = env.account("alice", "台式机").await;
     let (bob, _) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&pc1.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &pc1.client).await;
     send(&bob, &dm, "恢复前的消息").await;
 
     // S3：新电脑用恢复密钥加入（12 个词），不需要旧电脑；以前的消息照样看得到。
@@ -279,8 +279,8 @@ async fn reset_starts_over_leaves_groups_and_friends_see_it() {
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
     let (mut carol, _) = env.account("carol", "carol 的电脑").await;
     let alice_uid = old_pc.client.uid().clone();
-    let dm = bob.client.add_friend(&old_pc.client.friend_link(false).await.unwrap()).await.unwrap();
-    carol.client.add_friend(&old_pc.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &old_pc.client).await;
+    approved_dm(&carol.client, &old_pc.client).await;
     let group = old_pc
         .client
         .create_group(&GroupProfile { name: "周末爬山".into(), ..Default::default() }, &[bob.client.uid().clone(), carol.client.uid().clone()])
@@ -374,16 +374,16 @@ async fn friends_groups_and_every_message_kind() {
     forged.eldest = Fixed([7; 32]);
     assert!(matches!(bob.client.add_friend(&forged).await.unwrap_err(), ClientError::Verify(_)));
 
-    // S9：加好友：两边立刻出现私聊，第一条是“通过好友链接添加，身份已核对”，对方不用同意。
-    let dm = bob.client.add_friend(&FriendLink::parse(&link.to_string()).unwrap()).await.unwrap();
-    let bob_uid = uid(&bob);
+    // S9 v9：接收方批准才出现私聊，创建环由批准者签名，来源仍是好友链接。
+    let dm = approved_link(&bob.client, &alice.client, &FriendLink::parse(&link.to_string()).unwrap()).await;
+    let accepting_uid = uid(&alice);
     for peer in [&mut alice, &mut bob] {
         let notice = wait_notice(peer, &dm, "新私聊", |c| matches!(c, ConvNotice::Created { kind: ConvKind::Dm, via: Some(Via::FriendLink), .. })).await;
-        assert_eq!(notice.author, bob_uid);
+        assert_eq!(notice.author, accepting_uid);
     }
     // 重复加、反过来加，都是同一个私聊。
     assert_eq!(bob.client.add_friend(&link).await.unwrap(), dm);
-    assert_eq!(alice.client.add_friend(&bob.client.friend_link(false).await.unwrap()).await.unwrap(), dm);
+    assert_eq!(approved_dm(&alice.client, &bob.client).await, dm);
     let own = alice.client.friend_link(false).await.unwrap();
     assert!(matches!(alice.client.add_friend(&own).await.unwrap_err(), ClientError::State(_)), "不能加自己");
 
@@ -443,7 +443,7 @@ async fn friends_groups_and_every_message_kind() {
     assert_eq!(bob.messages().iter().filter(|m| text_of(m).as_deref() == Some("只出现一次")).count(), 1);
 
     // S11：新建群：成员是认识的人；群名只有成员看得到。
-    carol.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    approved_dm(&carol.client, &alice.client).await;
     let profile = GroupProfile { name: "周末爬山".into(), description: "每周六早上".into(), avatar: Some(image_ref.clone()) };
     let group = alice.client.create_group(&profile, &[uid(&bob), uid(&carol)]).await.unwrap();
     let alice_uid = uid(&alice);
@@ -466,13 +466,15 @@ async fn friends_groups_and_every_message_kind() {
     carol.wait_text(" 群里第一条").await;
 
     // S10：和群成员私聊，不用先加好友；身份以群里的为准。
-    let dm_bc = bob.client.open_dm(&uid(&carol), &group).await.unwrap();
+    let request=friend_im_client::core::ids::RequestId::random();
+    bob.client.request_group_friend(&request,&uid(&carol),&group,"").await.unwrap();
+    let dm_bc=carol.client.accept_friend(&request).await.unwrap().record.conversation.unwrap();
     wait_notice(&mut carol, &dm_bc, "群里认识的私聊", |c| matches!(c, ConvNotice::Created { via: Some(Via::Group { conv }), .. } if conv == &group)).await;
     send(&bob, &dm_bc, "群里看到你了").await;
     carol.wait_text("群里看到你了").await;
 
     // S12：任何成员都能邀请人；新成员看得到以前的全部消息。
-    dave.client.add_friend(&carol.client.friend_link(false).await.unwrap()).await.unwrap();
+    approved_dm(&dave.client, &carol.client).await;
     carol.client.invite(&group, &[uid(&dave)]).await.unwrap();
     for peer in [&mut alice, &mut bob, &mut dave] {
         let notice = wait_notice(peer, &group, "邀请提示", |c| matches!(c, ConvNotice::Added { .. })).await;
@@ -556,7 +558,7 @@ async fn interrupted_file_transfers_resume_where_they_stopped() {
     let env = Env::start().await;
     let (alice, _) = env.account("alice", "alice 的电脑").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     let data: Vec<u8> = (0..(20 * 1024 * 1024 + 7)).map(|i: u32| (i.wrapping_mul(31) % 251) as u8).collect();
     // 第一段请求传到 3 MiB 时连接被掐：客户端问服务器收到哪里，从那里接着传。
     env.server.proxy.cut_once_after(3 * 1024 * 1024);
@@ -586,7 +588,7 @@ async fn history_by_time_activity_and_file_ranges() {
     let (mut alice, _) = env.account("alice", "alice 的电脑").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
     let (carol, _) = env.account("carol", "carol 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     wait_notice(&mut alice, &dm, "新私聊", |c| matches!(c, ConvNotice::Created { .. })).await;
     // 五条消息，服务器时间各不相同。
     let mut sent = Vec::new();
@@ -681,7 +683,7 @@ async fn reconnects_and_catches_up_without_loss_or_duplicates() {
     let mut alice = Peer::connect(&direct, "alice 的电脑", Credentials::generate(), Some(env.cindy.token("alice", "alice")), None).await.unwrap();
     alice.client.provision().await.unwrap();
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     send(&alice, &dm, "断网前").await;
     bob.wait_text("断网前").await;
 
@@ -730,7 +732,7 @@ async fn server_restart_keeps_everything_and_clients_reconnect() {
     let mut env = Env::start().await;
     let (mut alice, _) = env.account("alice", "alice 的电脑").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     send(&alice, &dm, "重启前").await;
     bob.wait_text("重启前").await;
 
@@ -890,7 +892,7 @@ async fn forged_members_devices_and_keys_are_rejected() {
     let (mut alice, _) = env.account("alice", "alice 的电脑").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
     let (mallory, _) = env.account("mallory", "mallory 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     let group = alice.client.create_group(&GroupProfile { name: "小组".into(), ..Default::default() }, &[bob.client.uid().clone()]).await.unwrap();
     let hello = send(&alice, &dm, "私聊内容").await;
     send(&alice, &group, "群内容").await;
@@ -1009,9 +1011,9 @@ async fn forged_members_devices_and_keys_are_rejected() {
     )
     .unwrap();
     let fresh_bob = Peer::connect(&env.server.url(), "bob 的电脑", bob_creds.clone(), None, None).await.unwrap();
-    let page = fresh_bob.client.history(&dm, None, 10).await.unwrap();
-    assert!(page.items.iter().any(|i| matches!(i, HistoryItem::Rejected { id, .. } if id == &hello)), "{page:?}");
-    assert!(texts(&page.items).is_empty());
+    // Alice now signs the creation when approving. Tampering with her account
+    // rejects the conversation chain before any message can be exposed.
+    assert!(matches!(fresh_bob.client.history(&dm, None, 10).await.unwrap_err(), ClientError::Verify(_)));
     fresh_bob.client.close();
     db.execute("DELETE FROM account_links WHERE uid = ?1 AND seq = ?2", params![alice_ref.uid.as_str(), account_seq + 1]).unwrap();
 
@@ -1090,7 +1092,7 @@ async fn server_keeps_only_ciphertext() {
     let env = Env::start().await;
     let (mut alice, _) = env.account("alice", "alice 的电脑").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     let probes = [
         "私聊明文探针-甲乙丙丁",
         "群聊明文探针-戊己庚辛",

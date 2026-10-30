@@ -125,7 +125,7 @@ async fn live_against_deployed_server() {
 
     // S8、S9：加好友、私聊；同账号的两台电脑都收到。
     let started = Instant::now();
-    let dm = b1.client.add_friend(&a1.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&b1.client, &a1.client).await;
     note("凭好友链接加好友", format!("{:?}", started.elapsed()));
     let first = format!("R2私聊明文探针-{probe}");
     send(&a1, &dm, &first).await;

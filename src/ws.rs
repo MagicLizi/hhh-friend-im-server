@@ -11,7 +11,9 @@ use axum::response::Response as HttpResponse;
 use friend_im_core::bytes::Fixed;
 use friend_im_core::crypto;
 use friend_im_core::limits;
-use friend_im_core::wire::{self, ClientFrame, ErrorCode, HelloAuth, Request, Response, ServerFrame, WireError};
+use friend_im_core::wire::{
+    self, ClientFrame, ErrorCode, HelloAuth, Request, Response, ServerFrame, WireError,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Notify, mpsc};
 
@@ -50,7 +52,9 @@ async fn serve(app: Arc<App>, socket: WebSocket) {
         while let Some(out) = rx.recv().await {
             match out {
                 Outbound::Frame(frame) => {
-                    let Ok(text) = serde_json::to_string(&frame) else { continue };
+                    let Ok(text) = serde_json::to_string(&frame) else {
+                        continue;
+                    };
                     if sink.send(Message::Text(text.into())).await.is_err() {
                         break;
                     }
@@ -73,23 +77,31 @@ async fn serve(app: Arc<App>, socket: WebSocket) {
     if tx.send(Outbound::Frame(Box::new(challenge))).await.is_err() {
         return;
     }
-    let registration = match tokio::time::timeout(HELLO_TIMEOUT, hello(&app, &mut stream, &tx, &kill, &nonce)).await {
-        Ok(Ok(registration)) => registration,
-        Ok(Err((id, error))) => {
-            tracing::info!(code = ?error.code, "登录失败");
-            let _ = tx.send(Outbound::Frame(Box::new(ServerFrame::Err { id, err: error }))).await;
-            let _ = tx.send(Outbound::Close).await;
-            drop(tx);
-            let _ = writer.await;
-            return;
-        }
-        Err(_) => {
-            let _ = tx.send(Outbound::Close).await;
-            drop(tx);
-            let _ = writer.await;
-            return;
-        }
-    };
+    let registration =
+        match tokio::time::timeout(HELLO_TIMEOUT, hello(&app, &mut stream, &tx, &kill, &nonce))
+            .await
+        {
+            Ok(Ok(registration)) => registration,
+            Ok(Err((id, error))) => {
+                tracing::info!(code = ?error.code, "登录失败");
+                let _ = tx
+                    .send(Outbound::Frame(Box::new(ServerFrame::Err {
+                        id,
+                        err: error,
+                    })))
+                    .await;
+                let _ = tx.send(Outbound::Close).await;
+                drop(tx);
+                let _ = writer.await;
+                return;
+            }
+            Err(_) => {
+                let _ = tx.send(Outbound::Close).await;
+                drop(tx);
+                let _ = writer.await;
+                return;
+            }
+        };
     let session = Session {
         uid: registration.uid.clone(),
         device: registration.device.clone(),
@@ -109,7 +121,10 @@ async fn serve(app: Arc<App>, socket: WebSocket) {
             break;
         };
         if matches!(frame.req, Request::Hello { .. }) {
-            app.hub.reply(&registration, err_frame(frame.id, fail(ErrorCode::BadRequest, "已经登录过了")));
+            app.hub.reply(
+                &registration,
+                err_frame(frame.id, fail(ErrorCode::BadRequest, "已经登录过了")),
+            );
             continue;
         }
         dispatch(&app, &session, &registration, frame).await;
@@ -130,8 +145,11 @@ async fn hello(
     kill: &Arc<Notify>,
     nonce: &Fixed<32>,
 ) -> Result<Registration, (u64, WireError)> {
-    let text = next_text(stream).await.ok_or((0, fail(ErrorCode::BadRequest, "连接断开")))?;
-    let frame: ClientFrame = serde_json::from_str(&text).map_err(|_| (0, fail(ErrorCode::BadRequest, "第一个请求读不懂")))?;
+    let text = next_text(stream)
+        .await
+        .ok_or((0, fail(ErrorCode::BadRequest, "连接断开")))?;
+    let frame: ClientFrame = serde_json::from_str(&text)
+        .map_err(|_| (0, fail(ErrorCode::BadRequest, "第一个请求读不懂")))?;
     let id = frame.id;
     let Request::Hello {
         protocol,
@@ -145,28 +163,51 @@ async fn hello(
         return Err((id, fail(ErrorCode::Unauthorized, "第一个请求必须是 hello")));
     };
     if protocol != wire::PROTOCOL_VERSION {
-        return Err((id, fail(ErrorCode::Unsupported, format!("服务器只支持接口版本 {}", wire::PROTOCOL_VERSION))));
+        return Err((
+            id,
+            fail(
+                ErrorCode::Unsupported,
+                format!("服务器只支持接口版本 {}", wire::PROTOCOL_VERSION),
+            ),
+        ));
     }
-    wire::check_hello(&device, nonce, &sig).map_err(|_| (id, fail(ErrorCode::Unauthorized, "电脑签名不对")))?;
+    wire::check_hello(&device, nonce, &sig)
+        .map_err(|_| (id, fail(ErrorCode::Unauthorized, "电脑签名不对")))?;
     let login = match auth {
         HelloAuth::Cindy { token } => match app.verifier.verify(&token).await {
             Ok(identity) => LoginAuth::Cindy(identity),
-            Err(CindyError::KeysUnavailable) => return Err((id, fail(ErrorCode::Internal, "暂时取不到 Cindy 的公钥，请稍后再试"))),
-            Err(CindyError::Expired) => return Err((id, fail(ErrorCode::Expired, "Cindy 凭证已过期，请重新登录 Cindy"))),
-            Err(CindyError::Invalid) => return Err((id, fail(ErrorCode::Unauthorized, "Cindy 凭证无效"))),
+            Err(CindyError::KeysUnavailable) => {
+                return Err((
+                    id,
+                    fail(ErrorCode::Internal, "暂时取不到 Cindy 的公钥，请稍后再试"),
+                ));
+            }
+            Err(CindyError::Expired) => {
+                return Err((
+                    id,
+                    fail(ErrorCode::Expired, "Cindy 凭证已过期，请重新登录 Cindy"),
+                ));
+            }
+            Err(CindyError::Invalid) => {
+                return Err((id, fail(ErrorCode::Unauthorized, "Cindy 凭证无效")));
+            }
         },
         HelloAuth::Session { token } => LoginAuth::Session(session_hash(&token.0)),
     };
     let tx = tx.clone();
     let kill = kill.clone();
     app.with_store(move |locked, hub| {
-        let (session, welcome, effects) = locked.store.login(login, device, &name, kind, now_ms())?;
+        let (session, welcome, effects) =
+            locked.store.login(login, device, &name, kind, now_ms())?;
         let approved = welcome.status == wire::DeviceStatus::Active;
         let registration = hub.register(&session.uid, &session.device, approved, tx, kill);
-        hub.reply(&registration, ServerFrame::Res {
-            id,
-            res: Response::Welcome { welcome },
-        });
+        hub.reply(
+            &registration,
+            ServerFrame::Res {
+                id,
+                res: Response::Welcome { welcome },
+            },
+        );
         hub.apply(&effects, Some(&registration));
         tracing::info!(device = %session.device, ?approved, "电脑已连接");
         Ok(registration)
@@ -176,17 +217,36 @@ async fn hello(
 }
 
 /// 在存储锁里执行一个请求：事务提交 → 推送入队 → 回执入队 →（需要时）关闭本连接，顺序固定。
-async fn dispatch(app: &Arc<App>, session: &Session, registration: &Arc<Registration>, frame: ClientFrame) {
+async fn dispatch(
+    app: &Arc<App>,
+    session: &Session,
+    registration: &Arc<Registration>,
+    frame: ClientFrame,
+) {
     let session = session.clone();
     let registration = registration.clone();
     app.with_store(move |locked, hub| {
         let id = frame.id;
         let now = now_ms();
-        let reading = matches!(&frame.req, Request::ReadingGet { .. } | Request::ReadingSet { .. });
+        let reading = matches!(
+            &frame.req,
+            Request::ReadingGet { .. } | Request::ReadingSet { .. }
+        );
+        let friends = matches!(
+            &frame.req,
+            Request::FriendRequests { .. }
+                | Request::FriendRequestGet { .. }
+                | Request::FriendRequestSend { .. }
+        );
         let result = run(locked, hub, &session, frame.req, now);
         match result {
             Ok((response, effects)) => {
-                if reading { hub.enable_reading(&registration); }
+                if reading {
+                    hub.enable_reading(&registration);
+                }
+                if friends {
+                    hub.enable_friends(&registration);
+                }
                 let close_self = hub.apply(&effects, Some(&registration));
                 hub.reply(&registration, ServerFrame::Res { id, res: response });
                 if close_self {
@@ -206,21 +266,54 @@ async fn dispatch(app: &Arc<App>, session: &Session, registration: &Arc<Registra
     .await;
 }
 
-fn run(locked: &mut Locked, hub: &crate::hub::Hub, s: &Session, req: Request, now: i64) -> OpResult {
+fn run(
+    locked: &mut Locked,
+    hub: &crate::hub::Hub,
+    s: &Session,
+    req: Request,
+    now: i64,
+) -> OpResult {
     let store = &mut locked.store;
     match req {
         Request::Hello { .. } => Err(fail(ErrorCode::BadRequest, "已经登录过了")),
         Request::Ping => Ok((Response::Pong, Default::default())),
+        Request::FriendRequestSend { envelope } => store.friend_request_send(s, &envelope, now),
+        Request::FriendRequests {
+            before,
+            limit,
+            incoming,
+            peer,
+        } => store.friend_requests(s, before, limit, incoming, peer.as_ref(), now),
+        Request::FriendRequestGet { request } => store.friend_request_get(s, &request, now),
+        Request::FriendRequestAccept {
+            request,
+            link,
+            keys,
+        } => store.friend_request_accept(s, &request, &link, &keys, now),
+        Request::FriendRequestReject { request } => {
+            store.friend_request_close(s, &request, false, now)
+        }
+        Request::FriendRequestWithdraw { request } => {
+            store.friend_request_close(s, &request, true, now)
+        }
         Request::GetChain { uid, epoch, after } => store.get_chain(s, &uid, epoch, after),
         Request::Provision { eldest, keys } => store.provision(s, &eldest, &keys, now),
-        Request::AppendAccount { links, keys } => store.append_account(s, &links, keys.as_ref(), now),
+        Request::AppendAccount { links, keys } => {
+            store.append_account(s, &links, keys.as_ref(), now)
+        }
         Request::Reset { eldest, keys } => store.reset(s, &eldest, &keys, now),
         Request::GetAccountKeys => store.get_account_keys(s),
         Request::GetRecoveryKeys => store.get_recovery_keys(s),
         Request::ListDevices => store.list_devices(s, &|d| hub.is_online(d)),
-        Request::JoinStart { pake, proof } => store.join_start(s, &pake, &proof, &|d| hub.is_online(d), now),
+        Request::JoinStart { pake, proof } => {
+            store.join_start(s, &pake, &proof, &|d| hub.is_online(d), now)
+        }
         Request::JoinRetry { request, pake } => store.join_retry(s, &request, &pake, now),
-        Request::JoinConfirm { request, attempt, confirm } => store.join_confirm(s, &request, attempt, &confirm, now),
+        Request::JoinConfirm {
+            request,
+            attempt,
+            confirm,
+        } => store.join_confirm(s, &request, attempt, &confirm, now),
         Request::JoinCancel { request } => store.join_cancel(s, &request, now),
         Request::JoinRespond {
             request,
@@ -228,7 +321,11 @@ fn run(locked: &mut Locked, hub: &crate::hub::Hub, s: &Session, req: Request, no
             pake,
             confirm,
         } => store.join_respond(s, &request, attempt, &pake, &confirm, now),
-        Request::JoinApprove { request, link, keys } => store.join_approve(s, &request, &link, &keys, now),
+        Request::JoinApprove {
+            request,
+            link,
+            keys,
+        } => store.join_approve(s, &request, &link, &keys, now),
         Request::JoinReject { request } => store.join_reject(s, &request, now),
         Request::ListJoinRequests => store.list_join_requests(s, now),
         Request::JoinWithRecovery { link, keys } => store.join_with_recovery(s, &link, &keys, now),
@@ -237,22 +334,41 @@ fn run(locked: &mut Locked, hub: &crate::hub::Hub, s: &Session, req: Request, no
         Request::ResolveFriendLink { token } => store.resolve_friend_link(s, &token),
         Request::GetProfiles { uids } => store.get_profiles(s, &uids),
         Request::CreateConv { link, keys } => store.create_conv(s, &link, &keys, now),
-        Request::AppendConv { conv, links, keys, invite } => store.append_conv(s, &conv, &links, keys.as_ref(), invite.as_ref(), now),
+        Request::AppendConv {
+            conv,
+            links,
+            keys,
+            invite,
+        } => store.append_conv(s, &conv, &links, keys.as_ref(), invite.as_ref(), now),
         Request::GrantConvKeys { conv, keys } => store.grant_conv_keys(s, &conv, &keys, now),
         Request::GetConv { conv, after } => store.get_conv(s, &conv, after),
         Request::GetConvKeys { conv } => store.get_conv_keys(s, &conv),
         Request::ListConvs => store.list_convs(s),
         Request::GetInvite { invite } => store.get_invite(s, &invite, now),
-        Request::JoinByInvite { conv, link, keys } => store.join_by_invite(s, &conv, &link, &keys, now),
+        Request::JoinByInvite { conv, link, keys } => {
+            store.join_by_invite(s, &conv, &link, &keys, now)
+        }
         Request::Send { env } => store.send(s, &env, &mut locked.limiter, now, true),
         Request::SendLan { env } => store.send(s, &env, &mut locked.limiter, now, false),
-        Request::ReleaseMessage { conv, id, direct_devices } => store.release_message(s, &conv, &id, &direct_devices),
-        Request::History { conv, before, limit, since_ms, until_ms } => store.history(s, &conv, before, limit, since_ms, until_ms),
+        Request::ReleaseMessage {
+            conv,
+            id,
+            direct_devices,
+        } => store.release_message(s, &conv, &id, &direct_devices),
+        Request::History {
+            conv,
+            before,
+            limit,
+            since_ms,
+            until_ms,
+        } => store.history(s, &conv, before, limit, since_ms, until_ms),
         Request::Activity { since_ms } => store.activity(s, since_ms),
         Request::Sync { since, limit } => store.sync(s, since, limit),
         Request::FileCreate { conv, size } => store.file_create(s, &conv, size, now),
         Request::ReadingMessages { conv, ids } => store.reading_messages(s, &conv, &ids),
         Request::ReadingGet { conv, after, limit } => store.reading_get(s, &conv, after, limit),
-        Request::ReadingSet { envelope } => store.reading_set(s, &envelope, &mut locked.reading_limiter, now),
+        Request::ReadingSet { envelope } => {
+            store.reading_set(s, &envelope, &mut locked.reading_limiter, now)
+        }
     }
 }

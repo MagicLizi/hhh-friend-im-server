@@ -20,7 +20,7 @@ use friend_im_core::wire::{DeviceKind, ErrorCode, Push, WireError};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 库结构版本：改表结构时加 1 并写迁移。
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 /// 签名链现状缓存的条数上限：超过就整体清空重新按需加载（1000 个账号的规模下很少触发）。
 const CACHE_MAX: usize = 20_000;
 
@@ -193,6 +193,8 @@ pub struct Effects {
 /// 推送的目标。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
+    /// 仅已协商好友申请扩展的连接。
+    FriendAccount(Uid),
     /// 仅某账号已协商阅读扩展的连接。
     ReadingAccount(Uid),
     /// 某账号所有已批准的电脑。
@@ -313,33 +315,83 @@ impl Store {
         std::fs::create_dir_all(data_dir).map_err(|e| format!("建不了数据目录：{e}"))?;
         let files_dir = data_dir.join("files");
         std::fs::create_dir_all(&files_dir).map_err(|e| format!("建不了文件目录：{e}"))?;
-        let conn = Connection::open(data_dir.join("friend-im.sqlite3")).map_err(|e| format!("打不开数据库：{e}"))?;
+        let conn = Connection::open(data_dir.join("friend-im.sqlite3"))
+            .map_err(|e| format!("打不开数据库：{e}"))?;
         Self::init(conn, files_dir)
     }
 
     fn init(conn: Connection, files_dir: PathBuf) -> Result<Self, String> {
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| e.to_string())?;
-        conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| e.to_string())?;
-        conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
-        conn.execute_batch(SCHEMA).map_err(|e| format!("建表失败：{e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        // Check the version before schema writes, and migrate atomically. Version 3
+        // intentionally refuses old servers: they do not enforce friend approval.
+        let has_meta: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if has_meta {
+            let current: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if !matches!(current.as_deref(), Some("1" | "2" | "3")) {
+                return Err(format!("数据库结构版本不认识：{current:?}"));
+            }
+        }
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch(SCHEMA)
+            .map_err(|e| format!("建表失败：{e}"))?;
         let version: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(|e| e.to_string())?;
         match version.as_deref().map(str::parse::<i64>) {
             None => {
-                conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?1)", params![SCHEMA_VERSION.to_string()])
-                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES('schema_version', ?1)",
+                    params![SCHEMA_VERSION.to_string()],
+                )
+                .map_err(|e| e.to_string())?;
             }
             Some(Ok(v)) if v == SCHEMA_VERSION => {}
             Some(Ok(1)) => {
-                conn.execute("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'computer'", []).map_err(|e| e.to_string())?;
-                conn.execute("UPDATE meta SET value = ?1 WHERE key = 'schema_version'", params![SCHEMA_VERSION.to_string()]).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'computer'",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
             }
+            Some(Ok(2)) => {}
             Some(other) => return Err(format!("数据库结构版本不认识：{other:?}")),
         }
-        let last_log: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM log", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+        tx.execute_batch(crate::ops_friends::SCHEMA)
+            .map_err(|e| format!("好友申请迁移失败：{e}"))?;
+        tx.execute(
+            "UPDATE meta SET value=?1 WHERE key='schema_version'",
+            params![SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        let last_log: i64 = conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM log", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             conn,
             accounts: HashMap::new(),
@@ -352,7 +404,8 @@ impl Store {
     /// 在线备份到另一个文件（SQLite backup 接口，不停服务）。
     pub fn backup_to(&self, path: &Path) -> Result<(), String> {
         let mut target = Connection::open(path).map_err(|e| e.to_string())?;
-        let backup = rusqlite::backup::Backup::new(&self.conn, &mut target).map_err(|e| e.to_string())?;
+        let backup =
+            rusqlite::backup::Backup::new(&self.conn, &mut target).map_err(|e| e.to_string())?;
         backup
             .run_to_completion(256, std::time::Duration::from_millis(5), None)
             .map_err(|e| e.to_string())
@@ -374,15 +427,29 @@ impl Store {
     }
 
     /// 写一条日志，返回日志序号（在事务里调用）。
-    pub(crate) fn append_log(conn: &Connection, ts_ms: i64, kind: &str, payload: Option<&str>) -> Result<u64, WireError> {
-        conn.execute("INSERT INTO log(ts_ms, kind, payload) VALUES(?1, ?2, ?3)", params![ts_ms, kind, payload])
-            .db()?;
+    pub(crate) fn append_log(
+        conn: &Connection,
+        ts_ms: i64,
+        kind: &str,
+        payload: Option<&str>,
+    ) -> Result<u64, WireError> {
+        conn.execute(
+            "INSERT INTO log(ts_ms, kind, payload) VALUES(?1, ?2, ?3)",
+            params![ts_ms, kind, payload],
+        )
+        .db()?;
         Ok(conn.last_insert_rowid() as u64)
     }
 
     /// 给一批账号写同一条日志的 feed 行。
-    pub(crate) fn fan_out<'a>(conn: &Connection, seq: u64, uids: impl IntoIterator<Item = &'a Uid>) -> Result<(), WireError> {
-        let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO feed(uid, seq) VALUES(?1, ?2)").db()?;
+    pub(crate) fn fan_out<'a>(
+        conn: &Connection,
+        seq: u64,
+        uids: impl IntoIterator<Item = &'a Uid>,
+    ) -> Result<(), WireError> {
+        let mut stmt = conn
+            .prepare_cached("INSERT OR IGNORE INTO feed(uid, seq) VALUES(?1, ?2)")
+            .db()?;
         for uid in uids {
             stmt.execute(params![uid.as_str(), seq as i64]).db()?;
         }
@@ -438,10 +505,16 @@ impl Store {
             .transpose()
     }
 
-    pub(crate) fn devices_of(&self, uid: &Uid, state: DeviceState) -> Result<Vec<DeviceRow>, WireError> {
+    pub(crate) fn devices_of(
+        &self,
+        uid: &Uid,
+        state: DeviceState,
+    ) -> Result<Vec<DeviceRow>, WireError> {
         let ids: Vec<String> = {
             let mut stmt = self.conn.prepare_cached("SELECT device FROM devices WHERE uid = ?1 AND status = ?2 ORDER BY joined_ms, created_ms").db()?;
-            let rows = stmt.query_map(params![uid.as_str(), state.as_str()], |r| r.get(0)).db()?;
+            let rows = stmt
+                .query_map(params![uid.as_str(), state.as_str()], |r| r.get(0))
+                .db()?;
             rows.collect::<Result<_, _>>().db()?
         };
         let mut out = Vec::with_capacity(ids.len());
@@ -454,13 +527,21 @@ impl Store {
     }
 
     /// 某账号某一轮签名链的现状（按需从库里加载并重新验一遍）。
-    pub(crate) fn account_state(&mut self, uid: &Uid, epoch: u32) -> Result<Option<AccountState>, WireError> {
+    pub(crate) fn account_state(
+        &mut self,
+        uid: &Uid,
+        epoch: u32,
+    ) -> Result<Option<AccountState>, WireError> {
         if let Some(state) = self.accounts.get(uid).and_then(|c| c.epochs.get(&epoch)) {
             return Ok(Some(state.clone()));
         }
         let links: Vec<(String, i64)> = {
             let mut stmt = self.conn.prepare_cached("SELECT link, log FROM account_links WHERE uid = ?1 AND epoch = ?2 ORDER BY seq").db()?;
-            let rows = stmt.query_map(params![uid.as_str(), epoch as i64], |r| Ok((r.get(0)?, r.get(1)?))).db()?;
+            let rows = stmt
+                .query_map(params![uid.as_str(), epoch as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .db()?;
             rows.collect::<Result<_, _>>().db()?
         };
         if links.is_empty() {
@@ -470,9 +551,14 @@ impl Store {
             .iter()
             .map(|(text, log)| Ok((from_json::<AccountLink>(text)?, *log as u64)))
             .collect::<Result<_, WireError>>()?;
-        let state = AccountState::verify_chain(uid, epoch, &parsed).map_err(|e| internal(format!("库里的账号签名链验不过：{e}")))?;
+        let state = AccountState::verify_chain(uid, epoch, &parsed)
+            .map_err(|e| internal(format!("库里的账号签名链验不过：{e}")))?;
         self.trim_caches();
-        self.accounts.entry(uid.clone()).or_default().epochs.insert(epoch, state.clone());
+        self.accounts
+            .entry(uid.clone())
+            .or_default()
+            .epochs
+            .insert(epoch, state.clone());
         Ok(Some(state))
     }
 
@@ -488,10 +574,16 @@ impl Store {
     }
 
     /// 把一批账号的签名链（各轮）都装进缓存，之后可以用 [`CacheDirectory`] 同步地校验会话签名链。
-    pub(crate) fn preload_accounts<'a>(&mut self, uids: impl IntoIterator<Item = &'a Uid>) -> Result<(), WireError> {
+    pub(crate) fn preload_accounts<'a>(
+        &mut self,
+        uids: impl IntoIterator<Item = &'a Uid>,
+    ) -> Result<(), WireError> {
         for uid in uids {
             let epochs: Vec<i64> = {
-                let mut stmt = self.conn.prepare_cached("SELECT DISTINCT epoch FROM account_links WHERE uid = ?1").db()?;
+                let mut stmt = self
+                    .conn
+                    .prepare_cached("SELECT DISTINCT epoch FROM account_links WHERE uid = ?1")
+                    .db()?;
                 let rows = stmt.query_map(params![uid.as_str()], |r| r.get(0)).db()?;
                 rows.collect::<Result<_, _>>().db()?
             };
@@ -508,8 +600,13 @@ impl Store {
             return Ok(Some(state.clone()));
         }
         let links: Vec<(String, i64)> = {
-            let mut stmt = self.conn.prepare_cached("SELECT link, log FROM conv_links WHERE conv = ?1 ORDER BY seq").db()?;
-            let rows = stmt.query_map(params![conv.as_str()], |r| Ok((r.get(0)?, r.get(1)?))).db()?;
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT link, log FROM conv_links WHERE conv = ?1 ORDER BY seq")
+                .db()?;
+            let rows = stmt
+                .query_map(params![conv.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+                .db()?;
             rows.collect::<Result<_, _>>().db()?
         };
         if links.is_empty() {
@@ -521,8 +618,11 @@ impl Store {
             .collect::<Result<_, WireError>>()?;
         let authors = friend_im_core::conv::link_uids(parsed.iter().map(|(l, _)| l));
         self.preload_accounts(&authors)?;
-        let directory = CacheDirectory { accounts: &self.accounts };
-        let state = ConvState::verify_chain(conv, &parsed, &directory).map_err(|e| internal(format!("库里的会话签名链验不过：{e}")))?;
+        let directory = CacheDirectory {
+            accounts: &self.accounts,
+        };
+        let state = ConvState::verify_chain(conv, &parsed, &directory)
+            .map_err(|e| internal(format!("库里的会话签名链验不过：{e}")))?;
         self.trim_caches();
         self.convs.insert(conv.clone(), state.clone());
         Ok(Some(state))
@@ -537,7 +637,9 @@ impl Store {
                  WHERE m1.uid = ?1 AND m1.left_log IS NULL AND m2.left_log IS NULL",
             )
             .db()?;
-        let rows = stmt.query_map(params![uid.as_str()], |r| r.get::<_, String>(0)).db()?;
+        let rows = stmt
+            .query_map(params![uid.as_str()], |r| r.get::<_, String>(0))
+            .db()?;
         let mut out: Vec<Uid> = Vec::new();
         for row in rows {
             out.push(Uid::parse(&row.db()?).map_err(internal)?);
@@ -549,10 +651,19 @@ impl Store {
     }
 
     /// 某账号在某会话里的成员区间：现在是成员返回 `Some(None)`，离开过返回 `Some(Some(离开时的日志序号))`，从没进过返回 `None`。
-    pub(crate) fn membership(&self, conv: &ConvId, uid: &Uid) -> Result<Option<Option<u64>>, WireError> {
+    pub(crate) fn membership(
+        &self,
+        conv: &ConvId,
+        uid: &Uid,
+    ) -> Result<Option<Option<u64>>, WireError> {
         let rows: Vec<Option<i64>> = {
-            let mut stmt = self.conn.prepare_cached("SELECT left_log FROM conv_members WHERE conv = ?1 AND uid = ?2").db()?;
-            let rows = stmt.query_map(params![conv.as_str(), uid.as_str()], |r| r.get(0)).db()?;
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT left_log FROM conv_members WHERE conv = ?1 AND uid = ?2")
+                .db()?;
+            let rows = stmt
+                .query_map(params![conv.as_str(), uid.as_str()], |r| r.get(0))
+                .db()?;
             rows.collect::<Result<_, _>>().db()?
         };
         if rows.is_empty() {
@@ -566,8 +677,13 @@ impl Store {
 
     /// 某会话现在的成员（按库里的成员区间，服务器用它决定推给谁）。
     pub(crate) fn current_members(&self, conv: &ConvId) -> Result<Vec<Uid>, WireError> {
-        let mut stmt = self.conn.prepare_cached("SELECT uid FROM conv_members WHERE conv = ?1 AND left_log IS NULL").db()?;
-        let rows = stmt.query_map(params![conv.as_str()], |r| r.get::<_, String>(0)).db()?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT uid FROM conv_members WHERE conv = ?1 AND left_log IS NULL")
+            .db()?;
+        let rows = stmt
+            .query_map(params![conv.as_str()], |r| r.get::<_, String>(0))
+            .db()?;
         let mut out = Vec::new();
         for row in rows {
             out.push(Uid::parse(&row.db()?).map_err(internal)?);
@@ -582,7 +698,13 @@ pub(crate) struct CacheDirectory<'a> {
 }
 
 impl Directory for CacheDirectory<'_> {
-    fn device(&self, uid: &Uid, eldest: &Fixed<32>, device: &DeviceId, log: u64) -> Option<DevicePublic> {
+    fn device(
+        &self,
+        uid: &Uid,
+        eldest: &Fixed<32>,
+        device: &DeviceId,
+        log: u64,
+    ) -> Option<DevicePublic> {
         self.accounts
             .get(uid)?
             .epochs
@@ -592,13 +714,21 @@ impl Directory for CacheDirectory<'_> {
     }
 
     fn eldest(&self, uid: &Uid) -> Option<Fixed<32>> {
-        self.accounts.get(uid)?.epochs.values().next_back().map(|s| s.eldest)
+        self.accounts
+            .get(uid)?
+            .epochs
+            .values()
+            .next_back()
+            .map(|s| s.eldest)
     }
 }
 
 #[cfg(test)]
 pub(crate) fn open_memory() -> Store {
-    let dir = std::env::temp_dir().join(format!("friend-im-test-{}", friend_im_core::ids::ConvId::random()));
+    let dir = std::env::temp_dir().join(format!(
+        "friend-im-test-{}",
+        friend_im_core::ids::ConvId::random()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     Store::init(Connection::open_in_memory().unwrap(), dir).unwrap()
 }
@@ -611,14 +741,57 @@ mod tests {
     use friend_im_core::keys::DeviceSecret;
 
     #[test]
+    fn unknown_schema_is_not_modified_and_v2_migration_is_backed_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("friend-im.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('schema_version','99');").unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+        assert!(Store::open(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("UPDATE meta SET value='2';").unwrap();
+        drop(conn);
+        let store = Store::open(dir.path()).unwrap();
+        let backup = dir.path().join("backup.sqlite3");
+        store.backup_to(&backup).unwrap();
+        let restored = Connection::open(backup).unwrap();
+        assert_eq!(
+            restored
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "3"
+        );
+        assert_eq!(
+            restored
+                .query_row("SELECT COUNT(*) FROM friend_requests", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn schema_is_created_and_reopen_keeps_version() {
         let dir = std::env::temp_dir().join(format!("friend-im-schema-{}", ConvId::random()));
         let store = Store::open(&dir).unwrap();
         assert_eq!(store.last_log, 0);
         drop(store);
         let store = Store::open(&dir).unwrap();
-        let version: String = store.conn.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, "2");
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "3");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -638,28 +811,52 @@ mod tests {
              CREATE TABLE log(seq INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT);",
         )
         .unwrap();
-        conn.execute("INSERT INTO accounts(uid, name, created_ms) VALUES(?1, 'migration', 1)", params![uid.as_str()]).unwrap();
+        conn.execute(
+            "INSERT INTO accounts(uid, name, created_ms) VALUES(?1, 'migration', 1)",
+            params![uid.as_str()],
+        )
+        .unwrap();
         conn.execute("INSERT INTO devices(device, uid, sign_pub, enc_pub, name, status, created_ms) VALUES(?1, ?2, ?3, ?4, '旧电脑', 'pending', 1)", params![device.id().as_str(), uid.as_str(), device.public().sign.0.to_vec(), device.public().enc.0.to_vec()]).unwrap();
         drop(conn);
 
         let store = Store::open(&dir).unwrap();
         let row = store.device(&device.id()).unwrap().unwrap();
         assert_eq!(row.kind, DeviceKind::Computer);
-        let version: String = store.conn.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, "2");
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "3");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn login_persists_mobile_device_kind() {
         let mut store = open_memory();
-        let identity = CindyIdentity { issuer: "https://auth.cindy.app".into(), member: "mobile-user".into(), name: "手机用户".into() };
+        let identity = CindyIdentity {
+            issuer: "https://auth.cindy.app".into(),
+            member: "mobile-user".into(),
+            name: "手机用户".into(),
+        };
         let device = DeviceSecret::generate();
         let session = store
-            .login(LoginAuth::Cindy(identity), device.public(), "我的手机", DeviceKind::Mobile, 1)
+            .login(
+                LoginAuth::Cindy(identity),
+                device.public(),
+                "我的手机",
+                DeviceKind::Mobile,
+                1,
+            )
             .unwrap()
             .0;
-        assert_eq!(store.device(&session.device).unwrap().unwrap().kind, DeviceKind::Mobile);
+        assert_eq!(
+            store.device(&session.device).unwrap().unwrap().kind,
+            DeviceKind::Mobile
+        );
     }
 
     #[test]

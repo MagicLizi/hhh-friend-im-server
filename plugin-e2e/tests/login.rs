@@ -219,6 +219,7 @@ async fn cindy_login_opens_the_account_and_approves_new_computers() {
     let key_step = step(&a1, from, &flow, "出示恢复密钥", |s| s["kind"] == "showText" && s["layout"] == "words").await;
     assert_eq!(key_step["noCancel"], true);
     assert_eq!(key_step["ack"], "我已保存恢复密钥");
+    assert!(key_step.to_string().contains("只有它能找回账号"), "恢复密钥找不回聊天记录：{key_step}");
     let recovery = key_step["text"].as_str().unwrap().to_owned();
     assert_eq!(recovery.split_whitespace().count(), 12);
     {
@@ -255,6 +256,7 @@ async fn cindy_login_opens_the_account_and_approves_new_computers() {
     assert!(approved["title"].as_str().unwrap().starts_with("已批准「"), "{approved}");
     let joined = ended(&a2, a2_from, &a2_flow, "login/finished").await;
     assert_eq!(joined["title"], "这台电脑已加入");
+    assert!(joined["message"].as_str().unwrap().contains("有旧电脑或聊天对象在线时"), "历史要等别的设备在线才补：{joined}");
     wait_notices(&a1, "批准后提醒拿掉、多一条“新增了电脑”", |n| {
         !n.iter().any(|x| x["id"].as_str().unwrap().starts_with("join-"))
             && n.iter().any(|x| x["text"].as_str().unwrap().starts_with("你的账号新增了电脑") && x["action"]["id"] == "devices")

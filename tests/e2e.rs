@@ -478,6 +478,11 @@ async fn friends_groups_and_every_message_kind() {
     assert!(dave.send_as(&group, &MsgId::random(), text("还能发吗")).await.is_err());
     dave.settle(Duration::from_millis(300)).await;
     assert!(!dave.texts(&group).await.contains(&"移出 dave 之后".to_owned()), "被移出的人从任何路径都拿不到之后的");
+    // 第二道防线：就算密文漏到他手里也解不开。
+    let said = alice.messages_in(&group).await.into_iter().find(|m| text_of(m).as_deref() == Some("移出 dave 之后")).unwrap();
+    let leaked = alice.host.db.lock().unwrap()[&group][&said.id].raw.clone();
+    assert!(alice.client.open_record(&group, &leaked).await.is_ok());
+    assert!(dave.client.open_record(&group, &leaked).await.is_err(), "换过代，他手里没有这一代的钥匙");
     // 群里换过代之后凭旧链接加入的人：拿到的是发邀请时那一代，别的成员自动补发当前一代，照样读得到新消息。
     frank.client.join_by_invite(&InviteLink::parse(&invite_text).unwrap()).await.unwrap();
     eventually("frank 拿到当前一代钥匙和以前的消息", async || frank.texts(&group).await.contains(&"移出 dave 之后".to_string()).then_some(())).await;

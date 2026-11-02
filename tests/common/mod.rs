@@ -554,6 +554,17 @@ async fn device_loop(client: Client, host: MemHost, mut updates: Updates, mut co
     let mut engine = Engine::new(store, ClientAuthority::new(client.clone()));
     meet_everyone(&mut engine, &client, true).await;
     flush(&mut engine, &client).await;
+    // 和插件一样：刚发出来的消息走快车道，不排在补历史的帧后面。
+    let (live_tx, mut live) = tokio::sync::mpsc::unbounded_channel();
+    let (rest_tx, mut rest) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(update) = updates.recv().await {
+            let fast = matches!(&update, Update::Frame { frame, .. } if frame.is_live());
+            if (if fast { &live_tx } else { &rest_tx }).send(update).is_err() {
+                break;
+            }
+        }
+    });
     loop {
         tokio::select! {
             biased;
@@ -561,7 +572,11 @@ async fn device_loop(client: Client, host: MemHost, mut updates: Updates, mut co
                 let Some(command) = command else { break };
                 on_command(&mut engine, &client, command).await;
             }
-            update = updates.recv() => {
+            update = live.recv() => {
+                let Some(update) = update else { break };
+                on_update(&mut engine, &client, &events, update).await;
+            }
+            update = rest.recv() => {
                 let Some(update) = update else { break };
                 on_update(&mut engine, &client, &events, update).await;
             }

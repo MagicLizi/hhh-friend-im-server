@@ -440,9 +440,9 @@ async fn flush(engine: &mut Sync, client: &Client) {
             PeerFrame::Sync { conv, .. } | PeerFrame::Want { conv, .. } | PeerFrame::Have { conv, .. } | PeerFrame::Deny { conv } => Some(conv.clone()),
             _ => None,
         };
-        match client.send_frame(&to, conv.as_ref(), &frame).await {
-            Ok(true) => {}
-            _ => engine.peer_offline(&to),
+        // 和插件一样：只有“对方不在线”才算下线；这一帧被拒（比如对方刚退群）不影响别的会话。
+        if let Ok(false) = client.send_frame(&to, conv.as_ref(), &frame).await {
+            engine.peer_offline(&to);
         }
     }
 }
@@ -473,7 +473,7 @@ async fn on_command(engine: &mut Sync, client: &Client, command: Command) {
             let result = async {
                 let seen = engine.seen_max(&conv).await.map_err(|e| ClientError::state(e.0))?;
                 let at = next_at(client.now_ms().await, seen);
-                let raw = client.seal(&conv, &id, content, at).await?;
+                let (raw, at) = client.seal(&conv, &id, content, at).await?;
                 engine.local(&conv, raw).await.map_err(|e| ClientError::state(e.0))?;
                 Ok(at)
             }
@@ -485,7 +485,7 @@ async fn on_command(engine: &mut Sync, client: &Client, command: Command) {
                 let key: Key = engine.key_of(&conv, &target).await.map_err(|e: SyncError| ClientError::state(e.0))?.ok_or_else(|| ClientError::state("不在本机"))?;
                 let seen = engine.seen_max(&conv).await.map_err(|e| ClientError::state(e.0))?;
                 let at = next_at(client.now_ms().await, seen);
-                let raw = client.seal(&conv, &MsgId::random(), Content::Recall { target: target.clone(), target_at: key.at }, at).await?;
+                let (raw, _) = client.seal(&conv, &MsgId::random(), Content::Recall { target: target.clone(), target_at: key.at }, at).await?;
                 let applied = engine.local(&conv, raw).await.map_err(|e| ClientError::state(e.0))?;
                 if applied.rejected > 0 {
                     return Err(ClientError::state("只能撤回自己的消息"));
@@ -510,6 +510,10 @@ async fn on_update(engine: &mut Sync, client: &Client, events: &tokio::sync::mps
                 if client.may_share(&conv, &from).await {
                     let _ = client.merge_reading(&conv, records).await;
                 }
+            }
+            // 这里的“宿主”不存文件：如实说没有，要的人接着问下一台。
+            PeerFrame::FileWant { req, conv, .. } => {
+                let _ = client.send_frame(&from, Some(&conv), &PeerFrame::FileMissing { req }).await;
             }
             frame => {
                 let _ = engine.on_frame(&from, frame).await;

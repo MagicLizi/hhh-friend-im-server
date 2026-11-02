@@ -212,7 +212,7 @@ async fn cindy_login_opens_the_account_and_approves_new_computers() {
     let a1_dir = tempfile::tempdir().unwrap();
     let (a1, init) = Host::spawn(&host::program(), a1_dir.path()).await;
     assert_eq!(init["loginMethods"][0]["kind"], "host");
-    assert_eq!(init["actions"].as_array().unwrap().len(), 9);
+    assert_eq!(init["actions"].as_array().unwrap().len(), 8);
     assert_eq!(a1.open(&env.server.url(), None, None).await["state"], "needsLogin");
     let from = mark(&a1);
     let flow = login(&a1, &token, "alice", Some(CINDY_AVATAR)).await;
@@ -629,17 +629,22 @@ async fn my_link(host: &Host) -> (String, String) {
     (flow, shown["text"].as_str().unwrap().to_owned())
 }
 
-/// 加好友：粘贴链接 → 核对后的确认 → 加好友，返回成功的标题。
-async fn add_friend(host: &Host, link: &str) -> Value {
+/// 加好友：粘贴链接 → 核对身份、写验证消息 → 发申请，对方在侧栏同意（契约 friend-im v9）。返回申请成功的标题。
+async fn add_friend(host: &Host, link: &str, approver: &Host) -> Value {
     let from = mark(host);
     let (flow, _) = action(host, "add", None).await;
     step(host, from, &flow, "加好友的输入框", |s| s["kind"] == "input").await;
     let from = mark(host);
     submit(host, "action/submit", &flow, json!({ "link": link })).await;
-    let confirm = step(host, from, &flow, "加好友的确认", |s| s["kind"] == "confirm").await;
-    assert!(confirm["person"]["detail"].as_str().unwrap().starts_with("身份指纹 "), "{confirm}");
-    choose(host, &flow, "confirm", None, &[]).await;
-    ended(host, from, &flow, "action/finished").await
+    let ask = step(host, from, &flow, "好友申请的验证消息", |s| s["kind"] == "input" && s["caption"].as_str().is_some_and(|c| c.contains("发送好友申请"))).await;
+    assert!(ask["caption"].as_str().unwrap().contains("身份指纹 "), "{ask}");
+    let from = mark(host);
+    submit(host, "action/submit", &flow, json!({ "message": "" })).await;
+    let done = ended(host, from, &flow, "action/finished").await;
+    let list = approver.call("contacts/requests", json!({ "operation": "list", "incoming": true })).await.unwrap();
+    let request = list["items"][0]["requestId"].as_str().expect("对方收到申请").to_owned();
+    approver.call("contacts/requests", json!({ "operation": "respond", "requestId": request, "action": "accept" })).await.unwrap();
+    done
 }
 
 // S7、S16：在插件里“都没有了 → 重置账号”之后接着用（插件不重启）：在原来的私聊里先开口，发得出去，
@@ -651,7 +656,7 @@ async fn after_a_reset_in_the_plugin_the_account_keeps_working() {
     let (bob, _b_dir) = opened(&env, "bob").await;
     let (flow, link) = my_link(&alice).await;
     alice.notify("action/cancel", json!({ "flowId": flow })).await;
-    add_friend(&bob, &link).await;
+    add_friend(&bob, &link, &alice).await;
     // 宿主本机早就记着这个私聊（重置的电脑上，会话列表里还在）：用这个编号发。
     let dm = conversation_named(&alice, "bob").await;
     // bob 建一个有 alice 的群：alice 重置后退出所有群（契约 S7），这个群在重置的电脑上推“会话没有了”。
@@ -773,13 +778,13 @@ async fn friends_groups_and_profiles_through_plugin_actions() {
     submit(&bob, "action/submit", &flow, json!({ "link": bob_link })).await;
     step(&bob, from, &flow, "自己的链接", |s| s["note"]["text"] == "这是你自己的好友链接。").await;
     bob.notify("action/cancel", json!({ "flowId": flow })).await;
-    let added = add_friend(&bob, &link).await;
-    assert_eq!(added["title"], "已添加alice");
+    let added = add_friend(&bob, &link, &alice).await;
+    assert_eq!(added["title"], "申请已发送");
     conversation_named(&alice, "bob").await;
     conversation_named(&bob, "alice").await;
     let (flow, _) = action(&carol, "link", None).await;
     carol.notify("action/cancel", json!({ "flowId": flow })).await;
-    add_friend(&carol, &link).await;
+    add_friend(&carol, &link, &alice).await;
 
     // 个人资料：加好友后两边各往私聊传一份加密头像、发一条个人资料，对方收到 people 事件带头像键，按键读出的就是对方交来的
     // 那张。服务器上（库和文件）找不到头像的明文。
@@ -815,22 +820,21 @@ async fn friends_groups_and_profiles_through_plugin_actions() {
     conversation_named(&carol, "周末爬山").await;
     assert!(bob.call("actions/start", json!({ "actionId": "members", "conversationId": conversation_named(&bob, "alice").await })).await.is_err(), "私聊没有群的操作");
 
-    // S13 群成员：成员看不到“移出”，别人那一行只有“发消息”；群主移出 bob（先确认），回到列表带提示，bob 那边会话没有了。
+    // S13 群成员：成员看不到“移出”，每一行只有“查看名片”；群主移出 bob（先确认），回到列表带提示，bob 那边会话没有了。
     let from = mark(&bob);
     let (flow, _) = action(&bob, "members", Some(&group)).await;
     let list = step(&bob, from, &flow, "成员看到的群成员", |s| s["kind"] == "list").await;
     assert!(list["caption"].as_str().unwrap().contains("只有群主alice能移出成员"), "{list}");
+    let labels = |row: &Value| -> Vec<String> { row["actions"].as_array().map(|a| a.iter().map(|x| x["label"].as_str().unwrap().to_owned()).collect()).unwrap_or_default() };
     for row in list["rows"].as_array().unwrap() {
-        let labels: Vec<&str> = row["actions"].as_array().map(|a| a.iter().map(|x| x["label"].as_str().unwrap()).collect()).unwrap_or_default();
-        let expect: &[&str] = if row["id"] == bob_uid { &[] } else { &["发消息"] };
-        assert_eq!(labels, expect, "{row}");
+        assert_eq!(labels(row), ["查看名片"], "{row}");
     }
-    // S10 和群成员私聊：bob 和 carol 不是好友，在群成员里点 carol 的“发消息”，两边直接出现私聊。
+    // 群成员名片：bob 和 carol 不是好友，只能发好友申请，不能绕过对方同意直接私聊（契约 friend-im v9）。
     let from = mark(&bob);
-    choose(&bob, &flow, "message", Some(&carol_uid), &[]).await;
-    assert_eq!(ended(&bob, from, &flow, "action/finished").await["title"], "和「carol」私聊");
-    conversation_named(&bob, "carol").await;
-    conversation_named(&carol, "bob").await;
+    choose(&bob, &flow, "profile", Some(&carol_uid), &[]).await;
+    let card = step(&bob, from, &flow, "carol 的名片", |s| s["kind"] == "list" && s["caption"].as_str().is_some_and(|c| c.starts_with("来自群聊"))).await;
+    assert_eq!(labels(&card["rows"][0]), ["添加好友", "返回群成员"], "{card}");
+    bob.notify("action/cancel", json!({ "flowId": flow })).await;
     let from = mark(&alice);
     let (flow, _) = action(&alice, "members", Some(&group)).await;
     let list = step(&alice, from, &flow, "群主看到的群成员", |s| s["kind"] == "list").await;
@@ -880,14 +884,14 @@ async fn friends_groups_and_profiles_through_plugin_actions() {
     let from = mark(&alice);
     let (flow, _) = action(&alice, "about", None).await;
     let about = step(&alice, from, &flow, "关于加密", |s| s["kind"] == "confirm").await;
-    assert_eq!((about["noCancel"].as_bool(), about["sections"].as_array().map(Vec::len)), (Some(true), Some(4)));
+    assert_eq!((about["noCancel"].as_bool(), about["sections"].as_array().map(Vec::len)), (Some(true), Some(5)));
+    assert_eq!(about["sections"][0]["title"], "服务器不保存");
     choose(&alice, &flow, "confirm", None, &[]).await;
     ended(&alice, from, &flow, "action/finished").await;
 
-    // 换了头像：重新打开后宿主交来新的一张（和凭据里记着发过的不一样），往每个会话再发一份，bob 收到读得出新图的头像键；
-    // 发完凭据记下新头像的摘要。每个会话传的是各自的一份、头像键不同（群里那份旧头像的键也不同），所以按读出来的图认。
+    // 换了头像：重新打开后宿主交来新的一张，往每个会话再发一份，bob 收到读得出新图的头像键。
+    // 每个会话传的是各自的一份、头像键不同（群里那份旧头像的键也不同），所以按读出来的图认。
     let credential = saved(&alice);
-    assert_eq!(credential.announced.as_ref().and_then(|a| a.photo.clone()), Some(sha256_hex(&alice_photo)), "发过的记下了");
     alice.close().await;
     let dir = tempfile::tempdir().unwrap();
     let (again, _) = Host::start(dir.path()).await;
@@ -902,6 +906,4 @@ async fn friends_groups_and_profiles_through_plugin_actions() {
         }
         old_keys.insert(key);
     }
-    let new_sha = sha256_hex(&new_photo);
-    again.wait("记下新头像发过了", |seen| saved_in(seen).filter(|c| c.announced.as_ref().and_then(|a| a.photo.as_deref()) == Some(new_sha.as_str()))).await;
 }

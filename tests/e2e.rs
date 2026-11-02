@@ -993,7 +993,7 @@ async fn the_server_never_stores_a_message_a_recall_or_a_read_position() {
 async fn a_message_reaches_an_offline_friend_through_any_device_that_has_it() {
     let env = Env::start().await;
     let (mut desktop, recovery) = env.account("alice", "台式机").await;
-    let (mut bob, _) = env.account("bob", "bob 的电脑").await;
+    let (bob, _) = env.account("bob", "bob 的电脑").await;
     let dm = approved_dm(&bob.client, &desktop.client).await;
     send(&bob, &dm, "热身").await;
     desktop.wait_text("热身").await;

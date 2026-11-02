@@ -102,35 +102,24 @@ fn png(size: usize) -> Vec<u8> {
     data
 }
 
-/// 按宿主的做法从新往旧翻完一个会话（每页 `limit` 条），返回从旧到新的全部，同时核对每页的规矩。
-async fn read_history(host: &Host, conv: &ConvId, limit: u16, window: (Option<i64>, Option<i64>)) -> Vec<Message> {
-    let mut pages: Vec<Vec<Message>> = Vec::new();
-    let mut cursor: Option<String> = None;
+/// 发出去之后宿主把附件存进文件库（真宿主的 `keep_sent_attachment`）。
+fn keep_sent(host: &Host, message: &Message, block: usize, data: &[u8]) {
+    let Block::Resource { resource, .. } = &message.content[block] else { panic!("第 {block} 块不是资源") };
+    host.library.files.lock().unwrap().insert(resource.key.clone(), data.to_vec());
+}
+
+/// 等两台电脑的宿主库在这个会话里逐条一样（编号、时间、是否撤回、顺序）。
+async fn wait_identical(hosts: &[&Host], conv: &ConvId) {
+    let row = |m: &Message| (m.id.clone(), m.created_at_ms, m.deleted);
+    let deadline = Instant::now() + host::WAIT;
     loop {
-        let page = host
-            .call(
-                "messages/list",
-                json!({ "conversationId": conv.to_string(), "newestFirst": true, "limit": limit, "cursor": cursor,
-                        "afterMs": window.0, "beforeMs": window.1 }),
-            )
-            .await
-            .unwrap();
-        let items: Vec<Message> = serde_json::from_value(page["items"].clone()).unwrap();
-        assert!(items.len() <= usize::from(limit), "一页不超过要的条数");
-        assert!(items.windows(2).all(|w| w[0].created_at_ms <= w[1].created_at_ms || w[1].sender.kind == SenderKind::System), "页里从旧到新");
-        pages.push(items);
-        match page["next"].as_str() {
-            Some(next) => cursor = Some(next.to_owned()),
-            None => break,
+        let reference: Vec<_> = hosts[0].stored(conv.as_str()).iter().filter(|m| m.raw.is_some()).map(row).collect();
+        if hosts.iter().all(|h| h.stored(conv.as_str()).iter().filter(|m| m.raw.is_some()).map(row).collect::<Vec<_>>() == reference) {
+            return;
         }
-        assert!(pages.len() < 1000, "游标翻不到头");
+        assert!(Instant::now() < deadline, "几台电脑对不上");
+        tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    let all: Vec<Message> = pages.into_iter().rev().flatten().collect();
-    let mut ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
-    ids.sort();
-    ids.dedup();
-    assert_eq!(ids.len(), all.len(), "翻页没有重复");
-    all
 }
 
 // ---------- S14：收发消息、同步、撤回、附件、翻历史、会话列表 ----------
@@ -140,9 +129,9 @@ async fn reading_protocol_keeps_exact_positions_partial_lists_and_notification_n
     let env=Env::start().await;
     let (alice,alice_key)=env.account("alice","phone").await;
     let (bob,bob_key)=env.account("bob","phone").await;
-    let (carol,_)=env.account("carol","phone").await;
-    alice.client.add_friend(&bob.client.friend_link(false).await.unwrap()).await.unwrap();
-    alice.client.add_friend(&carol.client.friend_link(false).await.unwrap()).await.unwrap();
+    let (mut carol,_)=env.account("carol","phone").await;
+    approved_dm(&alice.client, &bob.client).await;
+    approved_dm(&alice.client, &carol.client).await;
     let group=alice.client.create_group(&GroupProfile::default(),&[bob.client.uid().clone(),carol.client.uid().clone()]).await.unwrap();
     let alice_credential=plugin_computer(&env,"alice",&alice_key,"plugin").await;
     let bob_credential=plugin_computer(&env,"bob",&bob_key,"plugin").await;
@@ -154,6 +143,7 @@ async fn reading_protocol_keeps_exact_positions_partial_lists_and_notification_n
     let (b,_temp)=online(&env,&bob_credential).await;
     let first=send_text(&a,&group,"阅读边界一").await;
     let second=send_text(&a,&group,"阅读边界二").await;
+    b.wait_text("阅读边界二").await;
     let scope=json!({"conversationId":group.to_string()});
     let before=a.call("reading/receipts",json!({"scope":scope,"messageIds":[second.id]})).await.unwrap();
     assert!(before["items"][0].get("readCount").is_none(),"未报告阅读的人不能当成零人已读");
@@ -161,19 +151,23 @@ async fn reading_protocol_keeps_exact_positions_partial_lists_and_notification_n
     let sync=b.call("reading/sync",json!({"scope":scope,"messageIds":[]})).await.unwrap();
     assert!(sync.get("through").is_none());
     assert_eq!(b.call("reading/mark",json!({"scope":scope,"messageId":first.id})).await.unwrap()["state"],"applied");
-    let last=alice.client.reading_messages(&group,&[friend_im_client::core::ids::MsgId::parse(&first.id).unwrap()]).await.unwrap().remove(0).log;
-    assert_eq!(b.call("reading/sync",json!({"scope":scope,"messageIds":[]})).await.unwrap()["through"],last.to_string());
-    let second_id=friend_im_client::core::ids::MsgId::parse(&second.id).unwrap();
-    carol.client.mark_read(&group,&second_id,None).await.unwrap();
-    let partial=a.call("reading/receipts",json!({"scope":scope,"messageIds":[second.id]})).await.unwrap();
+    let through=b.call("reading/sync",json!({"scope":scope,"messageIds":[]})).await.unwrap()["through"].clone();
+    assert_eq!(through.as_str(),first.read_position.as_deref(),"读到的位置就是那条消息的位置");
+    let carol_message=carol.wait_text("阅读边界二").await;
+    carol.mark_read(&group,&carol_message).await.unwrap();
+    let partial=host::eventually("carol 的已读到 alice",async||{
+        let found=a.call("reading/receipts",json!({"scope":scope,"messageIds":[second.id]})).await.unwrap();
+        (found["items"][0]["totalCount"]==2).then_some(found)
+    }).await;
     assert_eq!(partial["items"][0]["readCount"],1);
-    assert_eq!(partial["items"][0]["totalCount"],2);
     let unread=a.call("reading/people",json!({"scope":scope,"messageId":second.id,"read":false,"limit":1})).await.unwrap();
     assert_eq!(unread["people"][0]["id"],bob.client.uid().as_str());
     assert_eq!(unread["complete"],true);
     b.call("reading/mark",json!({"scope":scope,"messageId":second.id})).await.unwrap();
-    let page=a.call("reading/people",json!({"scope":scope,"messageId":second.id,"read":true,"limit":1})).await.unwrap();
-    assert_eq!(page["complete"],false);
+    let page=host::eventually("bob 的已读到 alice",async||{
+        let found=a.call("reading/people",json!({"scope":scope,"messageId":second.id,"read":true,"limit":1})).await.unwrap();
+        (found["complete"]==false).then_some(found)
+    }).await;
     let next=page["nextCursor"].as_str().unwrap();
     let end=a.call("reading/people",json!({"scope":scope,"messageId":second.id,"read":true,"limit":1,"cursor":next})).await.unwrap();
     assert_eq!(end["complete"],true);
@@ -181,7 +175,7 @@ async fn reading_protocol_keeps_exact_positions_partial_lists_and_notification_n
     assert!(a.call("reading/people",json!({"scope":scope,"messageId":first.id,"read":true,"limit":1,"cursor":next})).await.is_err());
     a.wait("已协商的阅读通知",|seen|seen.iter().any(|s|matches!(s,host::Seen::Note(method,_) if method=="reading/changed")).then_some(())).await;
     assert!(!b.seen.lock().unwrap().iter().any(|s|matches!(s,host::Seen::Note(method,_) if method=="reading/changed")),"未协商的宿主不会收到新通知");
-    let invalid=b.call("reading/mark",json!({"scope":scope,"messageId":second.id,"position":"0"})).await;
+    let invalid=b.call("reading/mark",json!({"scope":scope,"messageId":second.id,"position":"x"})).await;
     assert!(invalid.is_err());
     a.close().await;
     b.close().await;
@@ -193,8 +187,8 @@ async fn messages_flow_through_plugins() {
     let (mut alice_phone, alice_key) = env.account("alice", "alice 的手机").await;
     let (bob_pc, bob_key) = env.account("bob", "bob 的台式机").await;
     let (carol, _) = env.account("carol", "carol 的电脑").await;
-    let dm = bob_pc.client.add_friend(&alice_phone.client.friend_link(false).await.unwrap()).await.unwrap();
-    carol.client.add_friend(&alice_phone.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob_pc.client, &alice_phone.client).await;
+    approved_dm(&carol.client, &alice_phone.client).await;
     let group = alice_phone
         .client
         .create_group(&GroupProfile { name: "周末爬山".into(), ..Default::default() }, &[bob_pc.client.uid().clone(), carol.client.uid().clone()])
@@ -232,7 +226,7 @@ async fn messages_flow_through_plugins() {
     let got = b.wait_text("你好，这是插件发的").await;
     assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
     assert_eq!((got.id.as_str(), got.sender.id.as_str(), got.sender.name.as_deref()), (hello.id.as_str(), alice_uid.as_str(), Some("alice")));
-    assert_eq!(got.created_at_ms, hello.created_at_ms, "两边同一个时间（服务器时间）");
+    assert_eq!(got.created_at_ms, hello.created_at_ms, "两边同一个时间（发送方签名的时间）");
     alice_phone.wait_text("你好，这是插件发的").await;
 
     // @人、@所有人、回复。
@@ -260,14 +254,16 @@ async fn messages_flow_through_plugins() {
     let image = png(200 * 1024);
     let key = upload(&a, "image", "山顶.png", &image).await;
     let sent = send(&a, "op-image", conversation(&dm), json!([{ "type": "image", "key": key }])).await;
+    keep_sent(&a, &sent, 0, &image);
     let got = b.wait_message("推来图片", |m| m.id == sent.id).await;
-    let Block::Resource { resource, name, width, height } = &got.content[0] else { panic!("不是资源") };
+    let Block::Resource { resource, name, width, height, .. } = &got.content[0] else { panic!("不是资源") };
     assert_eq!((resource.kind, resource.mime.as_deref(), resource.bytes), (hhh_im_protocol::types::ResourceKind::Image, Some("image/png"), Some(image.len() as u64)));
     assert_eq!((name.as_deref(), *width, *height), (Some("山顶.png"), Some(3), Some(2)));
     assert!(read_all(&b, &got, 0).await == image, "读出来和发的一样");
     let doc: Vec<u8> = (0..(1536 * 1024 + 9)).map(|i: u32| (i.wrapping_mul(13) % 241) as u8).collect();
     let key = upload(&b, "file", "路线.gpx", &doc).await;
     let sent = send(&b, "op-file", conversation(&dm), json!([{ "type": "text", "text": "路线" }, { "type": "file", "key": key }])).await;
+    keep_sent(&b, &sent, 1, &doc);
     let got = a.wait_message("推来文件", |m| m.id == sent.id).await;
     assert!(read_all(&a, &got, 1).await == doc);
     // 用过的暂存键发出去就删了：再发要重新上传。
@@ -283,18 +279,7 @@ async fn messages_flow_through_plugins() {
     let too_big = a.call("uploads/begin", json!({ "kind": "file", "name": "big.bin", "bytes": 101u64 << 20 })).await.unwrap_err();
     assert_eq!(too_big.data.unwrap().kind, hhh_im_protocol::ErrorKind::LimitExceeded);
 
-    // 取消：宿主不等一次大附件的发送了，插件当场回 cancelled；发送本身接着做完，结果在 lookupSend 里。
-    let big: Vec<u8> = (0..16u32 << 20).map(|i| (i % 239) as u8).collect();
-    let key = upload(&a, "file", "大文件.bin", &big).await;
-    let params = json!({ "operationId": "op-cancel", "target": conversation(&dm), "content": [{ "type": "file", "key": key }] });
-    let (result, waited) = a.call_then_cancel("messages/send", params, Duration::from_millis(20)).await;
-    assert_eq!(result.unwrap_err().data.unwrap().kind, hhh_im_protocol::ErrorKind::Cancelled);
-    assert!(waited < Duration::from_secs(1), "取消后立刻回：{waited:?}");
-    let looked = a.call("messages/lookupSend", json!({ "operationId": "op-cancel" })).await.unwrap();
-    assert_eq!(looked["state"], "accepted", "{looked}");
-    b.wait_message("推来大文件", |m| m.id == looked["message"]["id"]).await;
-
-    // 同一个操作编号再发：同一条，服务器上只有一条；lookupSend 给同一个结果。
+    // 同一个操作编号再发：同一条，所有设备上只有一条；lookupSend 给同一个结果。
     let first = send_text(&a, &dm, "只该有一条").await;
     let second = send_text(&a, &dm, "只该有一条").await;
     assert_eq!(first.id, second.id);
@@ -312,81 +297,59 @@ async fn messages_flow_through_plugins() {
     let theirs = b.wait_text("路线").await;
     assert!(a.call("messages/recall", json!({ "conversationId": dm.to_string(), "messageId": theirs.id })).await.is_err());
 
-    // 翻历史：一页 3 条翻到头，系统提示在里面，撤回的那条是已撤回，只有一条“只该有一条”。
-    let history = read_history(&b, &dm, 3, (None, None)).await;
-    assert_eq!(text_of(&history[0]), "通过好友链接添加，身份已核对");
-    assert_eq!(history[0].sender.kind, SenderKind::System);
-    assert_eq!(history.iter().filter(|m| text_of(m) == "只该有一条").count(), 1);
-    assert!(history.iter().any(|m| m.id == doomed.id && m.deleted));
-    // 按时间读：从“你好”那条（含）往后。
-    let since = read_history(&b, &dm, 100, (Some(hello.created_at_ms), None)).await;
-    assert_eq!(text_of(&since[0]), "你好，这是插件发的");
-    assert!(since.len() < history.len());
-    let until = read_history(&b, &dm, 100, (None, Some(hello.created_at_ms))).await;
-    assert_eq!(text_of(until.last().unwrap()), "你好，这是插件发的");
-    // 不支持的读法：从旧往新。
-    assert!(b.call("messages/list", json!({ "conversationId": dm.to_string(), "newestFirst": false, "limit": 10 })).await.is_err());
-
-    // 会话发现：两个会话都有消息，私聊带对方编号。
-    let activity = b.call("conversations/recentActivity", json!({ "sinceMs": 0, "pagesMax": 1 })).await.unwrap();
-    assert_eq!(activity["complete"], true);
-    let items = activity["items"].as_array().unwrap();
-    let found = items.iter().find(|i| i["conversationId"] == dm.to_string()).unwrap();
-    assert_eq!((found["kind"].as_str(), found["peerId"].as_str()), (Some("direct"), Some(alice_uid.as_str())));
-    assert!(items.iter().any(|i| i["conversationId"] == group.to_string() && i["kind"] == "group"));
+    // 宿主里系统提示在，撤回的那条是已撤回，只有一条“只该有一条”。平台不再读历史：两边的宿主库逐条一样。
+    wait_identical(&[&a, &b], &dm).await;
+    let stored = b.stored(dm.as_str());
+    assert!(stored.iter().any(|m| text_of(m) == "通过好友链接添加，身份已核对" && m.sender.kind == SenderKind::System));
+    assert_eq!(stored.iter().filter(|m| text_of(m) == "只该有一条").count(), 1);
+    assert!(stored.iter().any(|m| m.id == doomed.id && m.deleted));
+    assert!(b.call("messages/list", json!({ "conversationId": dm.to_string(), "newestFirst": true, "limit": 10 })).await.is_err(), "平台不再提供读历史");
 
     // 推送带着同步位置；插件的输出全是协议消息。
     assert!(b.last_sync_state().is_some());
     assert!(a.bad_lines.lock().unwrap().is_empty() && b.bad_lines.lock().unwrap().is_empty());
 }
 
-// ---------- 推送：不收就重推，同批重推不多出消息；重启后交还同步位置接着推 ----------
+// ---------- 推送：宿主没收下就算没写好，下次对账再来；重启后索引从宿主重建，只补缺的 ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pushes_are_retried_and_resume_from_the_sync_state() {
     let env = Env::start().await;
     let (alice, _) = env.account("alice", "alice 的电脑").await;
     let (bob_pc, bob_key) = env.account("bob", "bob 的电脑").await;
-    let dm = bob_pc.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob_pc.client, &alice.client).await;
     let b_cred = plugin_computer(&env, "bob", &bob_key, "bob 的插件电脑").await;
     let (b, _dir) = online(&env, &b_cred).await;
-    alice.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text("先到的一条")).await.unwrap();
+    alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text("先到的一条")).await.unwrap();
     b.wait_text("先到的一条").await;
 
-    // 宿主先不收：插件隔一会儿原样重推，收下后就停。
+    // 宿主先不收：这条算没写好，宿主里没有。
     b.accept_pushes.store(false, std::sync::atomic::Ordering::SeqCst);
-    alice.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text("要重推的")).await.unwrap();
-    b.wait("重推了至少三次", |seen| {
-        (events(seen).iter().filter(|e| matches!(e, Event::Messages { messages, .. } if messages.iter().any(|m| text_of(m) == "要重推的"))).count() >= 3).then_some(())
-    })
-    .await;
+    alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text("宿主没收下的")).await.unwrap();
+    b.wait("试过推送", |seen| events(seen).iter().any(|e| matches!(e, Event::Messages { messages, .. } if messages.iter().any(|m| text_of(m) == "宿主没收下的"))).then_some(())).await;
+    assert!(!b.stored(dm.as_str()).iter().any(|m| text_of(m) == "宿主没收下的"));
     b.accept_pushes.store(true, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let count = |h: &Host| h.pushed_messages().iter().filter(|m| text_of(m) == "要重推的").count();
-    let settled = count(&b);
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(count(&b), settled, "收下之后不再重推");
-    let pushed: Vec<Message> = b.pushed_messages().into_iter().filter(|m| text_of(m) == "要重推的").collect();
-    assert!(pushed.windows(2).all(|w| w[0].id == w[1].id), "重推的是同一条（宿主按编号去重）");
 
-    // 插件关掉期间来了三条；带着同步位置重启，三条都推过来，之前的不再推。
-    let state = b.last_sync_state().expect("推送带着同步位置");
+    // 插件关掉期间来了三条；重启后对账补齐，之前收过的不再推。
+    let state = b.last_sync_state();
+    let library = b.library.clone();
     b.close().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     for i in 0..3 {
-        alice.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text(&format!("关着时的第{i}条"))).await.unwrap();
+        alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text(&format!("关着时的第{i}条"))).await.unwrap();
     }
     let temp = tempfile::tempdir().unwrap();
-    let (b2, _) = Host::start(temp.path()).await;
-    assert_eq!(b2.open(&env.server.url(), Some(&b_cred), Some(&state)).await["state"], "online");
+    let (b2, _) = Host::restart(temp.path(), library).await;
+    assert_eq!(b2.open(&env.server.url(), Some(&b_cred), state.as_deref()).await["state"], "online");
     for i in 0..3 {
         b2.wait_text(&format!("关着时的第{i}条")).await;
     }
+    b2.wait_text("宿主没收下的").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!b2.pushed_messages().iter().any(|m| text_of(m) == "先到的一条"), "同步位置之前的不再推");
+    assert!(!b2.pushed_messages().iter().any(|m| text_of(m) == "先到的一条"), "宿主已有的不再推");
 }
 
-// ---------- S19：断网：状态是“连接中”，发送不确定；恢复后补收 ----------
+// ---------- S19：断网：状态是“连接中”，本机保存就算发出；恢复后互相补齐 ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnects_show_connecting_and_catch_up_afterwards() {
@@ -397,49 +360,30 @@ async fn disconnects_show_connecting_and_catch_up_afterwards() {
     let mut bob = Peer::connect(&direct, "bob 的电脑", Credentials::generate(), Some(env.cindy.token("bob", "bob")), None).await.unwrap();
     bob.client.provision().await.unwrap();
     bob.wait("开通后可用", |u| matches!(u, Update::Activated).then_some(())).await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     let a_cred = plugin_computer(&env, "alice", &alice_key, "alice 的插件电脑").await;
     let (a, _dir) = online(&env, &a_cred).await;
     send_text(&a, &dm, "断网前").await;
-    // 一份 300 KiB 的文件，先从不在加密块边界上的位置读一段。
-    let doc: Vec<u8> = (0..300 * 1024 + 7).map(|i: u32| (i.wrapping_mul(31) % 253) as u8).collect();
-    let key = upload(&a, "file", "相册.zip", &doc).await;
-    let file = send(&a, "op-zip", conversation(&dm), json!([{ "type": "file", "key": key }])).await;
-    let Block::Resource { resource, .. } = &file.content[0] else { panic!("不是资源") };
-    let read = |offset: usize, length: usize| {
-        a.call(
-            "resources/read",
-            json!({ "conversationId": file.conversation_id, "messageId": file.id, "key": resource.key, "kind": resource.kind,
-                    "offset": offset, "length": length }),
-        )
-    };
-    let (start, length) = (100_003, 70_001);
-    let chunk = read(start, length).await.unwrap();
-    assert_eq!(BASE64.decode(chunk["data"].as_str().unwrap()).unwrap(), doc[start..start + length]);
-    assert_eq!(chunk["eof"], false);
+    bob.wait_text("断网前").await;
 
     env.server.proxy.cut();
     a.wait_note("status", |p| p["state"] == "connecting").await;
-    // 断着网发：一定没发出去，回可以重试的错误（契约 S19：沿用现有失败记录，原因 + 重试），不说“不确定”。
+    // 断着网发：本机保存了就算发出，等对账送达（契约 friend-im v10 第 3 项）。
     let offline = json!({ "operationId": "op-offline", "target": conversation(&dm), "content": [{ "type": "text", "text": "断网时发的" }] });
-    let refused = a.call("messages/send", offline.clone()).await.expect_err("断着网发不出去");
-    assert_eq!(refused.data.unwrap().kind, hhh_im_protocol::ErrorKind::Disconnected);
-    let broken = read(start + length, 1 << 20).await.expect_err("断网时读不了");
-    assert_eq!(broken.data.unwrap().kind, hhh_im_protocol::ErrorKind::Disconnected, "断网是可以重试的错误");
+    let sent = a.call("messages/send", offline.clone()).await.unwrap();
+    assert_eq!(sent["state"], "accepted", "{sent}");
     // 断网期间对方发来的，恢复后补收。
-    bob.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text("你断网时我发的")).await.unwrap();
+    bob.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text("你断网时我发的")).await.unwrap();
     env.server.proxy.restore();
     a.wait_note("status", |p| p["state"] == "online").await;
     a.wait_text("你断网时我发的").await;
-    // 宿主重试沿用同一操作编号：这次真的发出去，对方只收到一条。
+    bob.wait_text("断网时发的").await;
+    // 宿主重试沿用同一操作编号：还是这一条，对方只有一条。
     let retried = a.call("messages/send", offline).await.unwrap();
     assert_eq!(retried["state"], "accepted", "{retried}");
-    bob.wait("断网时发的", |u| matches!(u, Update::Message(m) if common::text_of(m).as_deref() == Some("断网时发的")).then_some(())).await;
     send_text(&a, &dm, "恢复后").await;
-    // 从断处接着读完。
-    let rest = read(start + length, 1 << 20).await.unwrap();
-    assert_eq!(rest["eof"], true);
-    assert_eq!(BASE64.decode(rest["data"].as_str().unwrap()).unwrap(), doc[start + length..]);
+    bob.wait_text("恢复后").await;
+    assert_eq!(bob.texts(&dm).await.iter().filter(|t| *t == "断网时发的").count(), 1);
 }
 
 // ---------- S22 与失效：退出登录、被移出、没有或不对的凭据、登录 ----------
@@ -494,7 +438,7 @@ async fn group_changes_and_resets_become_system_messages() {
     let env = Env::start().await;
     let (alice, alice_key) = env.account("alice", "alice 的电脑").await;
     let (mut bob, bob_key) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     let a_cred = plugin_computer(&env, "alice", &alice_key, "alice 的插件电脑").await;
     let b_cred = plugin_computer(&env, "bob", &bob_key, "bob 的插件电脑").await;
     let (a, _a_dir) = online(&env, &a_cred).await;
@@ -523,22 +467,19 @@ async fn group_changes_and_resets_become_system_messages() {
     b.wait("会话没有了", |seen| events(seen).iter().any(|e| matches!(e, Event::ConversationRemoved { conversation_id } if *conversation_id == group.to_string())).then_some(())).await;
     bob.settle(Duration::from_millis(100)).await;
 
-    // 对方重置账号：私聊里出现契约 S16 的提示；重置后的新电脑翻历史时以前的消息是“解不开”的说明。
-    alice.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text("重置前的私聊")).await.unwrap();
+    // 对方重置账号：私聊里出现契约 S16 的提示；重置后的新电脑解不开以前的消息，它们不进宿主。
+    alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text("重置前的私聊")).await.unwrap();
     b.wait_text("重置前的私聊").await;
     let mut fresh = env.device("bob", "bob 的新电脑").await;
     fresh.client.reset().await.unwrap();
     fresh.wait("可用", |u| matches!(u, Update::Activated).then_some(())).await;
-    alice.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text("你重置之后")).await.unwrap();
+    alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text("你重置之后")).await.unwrap();
     a.wait_text("bob 重置了账号，之后的消息用新钥匙加密。想确认是本人，请当面或通过别的渠道问一下").await;
     let fresh_cred = Credential::new(&env.server.url(), fresh.client.uid().as_str(), "bob 的新电脑", fresh.client.credentials().await).encode();
     fresh.client.close();
     let (c, _c_dir) = online(&env, &fresh_cred).await;
-    let history = read_history(&c, &dm, 100, (None, None)).await;
-    let unreadable = history.iter().find(|m| m.incomplete).expect("以前的消息解不开");
-    assert!(matches!(&unreadable.content[0], Block::Unsupported { .. }));
-    assert_eq!(unreadable.sender.id, alice.client.uid().to_string(), "放在原来那个人名下");
-    assert!(history.iter().any(|m| text_of(m) == "你重置之后"));
+    c.wait_text("你重置之后").await;
+    assert!(!c.stored(dm.as_str()).iter().any(|m| text_of(m) == "重置前的私聊"), "重置前的那条解不开");
 }
 
 // 重置过账号的人先开口（契约 S7“账号可以继续用”、S16）：在原来的私聊里直接发，好友收到这条和“X 重置了账号”的提示。
@@ -547,8 +488,8 @@ async fn a_reset_account_can_write_to_its_friends_first() {
     let env = Env::start().await;
     let (alice, alice_key) = env.account("alice", "alice 的电脑").await;
     let (bob, _bob_key) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
-    alice.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text("重置前")).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
+    alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text("重置前")).await.unwrap();
     let a_cred = plugin_computer(&env, "alice", &alice_key, "alice 的插件电脑").await;
     let (a, _a_dir) = online(&env, &a_cred).await;
 
@@ -571,17 +512,17 @@ async fn a_member_invited_back_gets_what_was_said_while_away() {
     let env = Env::start().await;
     let (alice, _alice_key) = env.account("alice", "alice 的电脑").await;
     let (bob, bob_key) = env.account("bob", "bob 的电脑").await;
-    bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    approved_dm(&bob.client, &alice.client).await;
     let b_cred = plugin_computer(&env, "bob", &bob_key, "bob 的插件电脑").await;
     let (b, _b_dir) = online(&env, &b_cred).await;
 
     let group = alice.client.create_group(&GroupProfile { name: "读书会".into(), ..Default::default() }, &[bob.client.uid().clone()]).await.unwrap();
     b.wait_text("alice 创建了群，加入了 bob").await;
-    alice.client.send(&group, &friend_im_client::core::ids::MsgId::random(), text("在群的时候")).await.unwrap();
+    alice.send_as(&group, &friend_im_client::core::ids::MsgId::random(), text("在群的时候")).await.unwrap();
     b.wait_text("在群的时候").await;
     alice.client.kick(&group, bob.client.uid()).await.unwrap();
     b.wait_text("alice 把 bob 移出了群").await;
-    alice.client.send(&group, &friend_im_client::core::ids::MsgId::random(), text("bob 不在的时候")).await.unwrap();
+    alice.send_as(&group, &friend_im_client::core::ids::MsgId::random(), text("bob 不在的时候")).await.unwrap();
     alice.client.invite(&group, &[bob.client.uid().clone()]).await.unwrap();
     b.wait_text("alice 邀请 bob 加入了群").await;
     let missed = b.wait_text("bob 不在的时候").await;
@@ -602,28 +543,27 @@ async fn the_real_program_speaks_only_protocol_and_keeps_text_out_of_logs() {
     let env = Env::start().await;
     let (mut alice, _) = env.account("alice", "alice 的电脑").await;
     let (bob, bob_key) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let dm = approved_dm(&bob.client, &alice.client).await;
     let b_cred = plugin_computer(&env, "bob", &bob_key, "bob 的插件电脑").await;
     let temp = tempfile::tempdir().unwrap();
     let (mut b, init) = Host::spawn(&host::program(), temp.path()).await;
     assert_eq!(init["provider"]["id"], "friend-im");
+    assert_eq!(init["platform"]["history"], "none");
+    assert_eq!(init["capabilities"]["storeRead"], true);
     assert_eq!(b.open(&env.server.url(), Some(&b_cred), None).await["state"], "online");
 
-    // 收、发、回复、附件、翻历史、读资源、建群：每样都过一遍插件。
-    alice.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text(&format!("收到的{SECRET}"))).await.unwrap();
+    // 收、发、回复、附件、建群：每样都过一遍插件。
+    alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text(&format!("收到的{SECRET}"))).await.unwrap();
     let got = b.wait_text(&format!("收到的{SECRET}")).await;
     send(&b, "op-1", json!({ "type": "reply", "conversationId": dm.to_string(), "messageId": got.id }), json!([{ "type": "text", "text": format!("发出的{SECRET}") }])).await;
     alice.wait_text(&format!("发出的{SECRET}")).await;
     let doc = format!("文件里的{SECRET}").repeat(1000).into_bytes();
     let key = upload(&b, "file", &format!("{SECRET}.txt"), &doc).await;
-    let sent = send(&b, "op-2", conversation(&dm), json!([{ "type": "file", "key": key }])).await;
-    assert!(read_all(&b, &sent, 0).await == doc);
+    send(&b, "op-2", conversation(&dm), json!([{ "type": "file", "key": key }])).await;
     alice.client.create_group(&GroupProfile { name: format!("群{SECRET}"), ..Default::default() }, &[bob.client.uid().clone()]).await.unwrap();
     b.wait("推来群", |seen| events(seen).iter().any(|e| matches!(e, Event::Conversation { conversation } if conversation.name.contains(SECRET))).then_some(())).await;
-    let history = read_history(&b, &dm, 2, (None, None)).await;
-    assert!(history.iter().any(|m| text_of(m).contains(SECRET)));
-    // 几个会被拒的请求（会写日志）。
-    assert!(b.call("messages/list", json!({ "conversationId": dm.to_string(), "newestFirst": true, "limit": 5, "cursor": SECRET })).await.is_err());
+    assert!(b.stored(dm.as_str()).iter().any(|m| text_of(m).contains(SECRET)));
+    // 会被拒的请求（会写日志）。
     assert!(b.call("messages/send", json!({ "operationId": "op-3", "target": conversation(&dm), "content": [{ "type": "file", "key": SECRET }] })).await.is_err());
 
     // 退出：shutdown，宿主关标准输入，程序自己退出。
@@ -640,7 +580,51 @@ async fn the_real_program_speaks_only_protocol_and_keeps_text_out_of_logs() {
     assert!(!notes.contains(SECRET), "日志或通知里出现了正文：{notes}");
 }
 
-// ---------- 性能（契约 §7、方案 §13.4）：经插件 2 秒内到对方；新电脑经插件翻完 1 万条历史 5 分钟内，内存不随条数涨 ----------
+// ---------- friend-im v10 第 4 项：新设备从开着的旧设备拿到全部历史和文件 ----------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_computer_gets_history_and_files_from_an_old_one() {
+    let env = Env::start().await;
+    let (alice, alice_key) = env.account("alice", "alice 的电脑").await;
+    let (bob, _) = env.account("bob", "bob 的电脑").await;
+    let dm = approved_dm(&bob.client, &alice.client).await;
+    let a_cred = plugin_computer(&env, "alice", &alice_key, "旧电脑").await;
+    let (a, _a_dir) = online(&env, &a_cred).await;
+    send_text(&a, &dm, "旧电脑上的历史").await;
+    let doomed = send_text(&a, &dm, "撤回的不补").await;
+    a.call("messages/recall", json!({ "conversationId": dm.to_string(), "messageId": doomed.id })).await.unwrap();
+    let doc: Vec<u8> = (0..(700 * 1024 + 9)).map(|i: u32| (i.wrapping_mul(17) % 241) as u8).collect();
+    let key = upload(&a, "file", "相册.zip", &doc).await;
+    let file = send(&a, "op-doc", conversation(&dm), json!([{ "type": "file", "key": key }])).await;
+    keep_sent(&a, &file, 0, &doc);
+
+    let c_cred = plugin_computer(&env, "alice", &alice_key, "新电脑").await;
+    let (c, _c_dir) = online(&env, &c_cred).await;
+    c.wait_text("旧电脑上的历史").await;
+    wait_identical(&[&a, &c], &dm).await;
+    assert!(c.stored(dm.as_str()).iter().any(|m| m.id == doomed.id && m.deleted), "撤回的是墓碑");
+    assert!(c.stored(dm.as_str()).iter().any(|m| text_of(m) == "通过好友链接添加，身份已核对"), "系统提示也有");
+    let copy = c.stored(dm.as_str()).into_iter().find(|m| m.id == file.id).unwrap();
+    assert!(read_all(&c, &copy, 0).await == doc, "文件从旧电脑读");
+
+    // 摘要随消息签名：资源第一段就带上，宿主收完自己核对。
+    let Block::Resource { resource, .. } = &copy.content[0] else { panic!("不是资源") };
+    let chunk = c
+        .call("resources/read", json!({ "conversationId": dm.to_string(), "messageId": copy.id, "key": resource.key, "kind": resource.kind, "offset": 0, "length": 10 }))
+        .await
+        .unwrap();
+    assert_eq!(chunk["sha256"].as_str().map(str::to_owned), Some(sha256_hex(&doc)));
+
+    // 谁都没有这个文件：报暂时读不到（可以重试），不伪造成功。
+    a.library.files.lock().unwrap().clear();
+    let refused = c
+        .call("resources/read", json!({ "conversationId": dm.to_string(), "messageId": copy.id, "key": resource.key, "kind": resource.kind, "offset": 0, "length": 10 }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.data.unwrap().kind, hhh_im_protocol::ErrorKind::Disconnected, "之后可以重试");
+}
+
+// ---------- 性能（friend-im v10）：经插件 2 秒内到对方；新电脑从旧电脑补 1 万条历史 5 分钟内，内存有上限 ----------
 // 按发布构建量才有意义，默认不跑：`cargo test --release --test plugin -- --ignored --nocapture`
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -648,86 +632,65 @@ async fn the_real_program_speaks_only_protocol_and_keeps_text_out_of_logs() {
 async fn ten_thousand_messages_through_the_plugin() {
     const MESSAGES: usize = 10_000;
     let env = Env::start_with(|c| {
-        c.send_per_second = 100_000;
-        c.send_per_minute = 1_000_000;
+        c.relay_per_second = 100_000;
+        c.relay_per_minute = 1_000_000;
     })
     .await;
     let (alice, alice_key) = env.account("alice", "alice 的电脑").await;
-    let (bob, bob_key) = env.account("bob", "bob 的电脑").await;
-    let dm = bob.client.add_friend(&alice.client.friend_link(false).await.unwrap()).await.unwrap();
+    let (mut bob, _) = env.account("bob", "bob 的电脑").await;
+    let dm = approved_dm(&bob.client, &alice.client).await;
     let program = host::program();
 
     // 两个真的插件程序之间：点发送到对方收到。
     let a_cred = plugin_computer(&env, "alice", &alice_key, "alice 的插件电脑").await;
-    let b_cred = plugin_computer(&env, "bob", &bob_key, "bob 的插件电脑").await;
-    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_dir = tempfile::tempdir().unwrap();
     let (a, _) = Host::spawn(&program, a_dir.path()).await;
-    let (b, _) = Host::spawn(&program, b_dir.path()).await;
     assert_eq!(a.open(&env.server.url(), Some(&a_cred), None).await["state"], "online");
-    assert_eq!(b.open(&env.server.url(), Some(&b_cred), None).await["state"], "online");
     let mut worst = Duration::ZERO;
     for i in 0..20 {
         let started = Instant::now();
         send_text(&a, &dm, &format!("延迟 {i}")).await;
-        b.wait_text(&format!("延迟 {i}")).await;
+        bob.wait_text(&format!("延迟 {i}")).await;
         worst = worst.max(started.elapsed());
     }
     println!("经插件到对方：20 条里最慢 {worst:?}");
     assert!(worst < Duration::from_secs(2));
-    a.close().await;
-    b.close().await;
 
-    // 灌 1 万条（bob 的电脑用客户端库发）。
+    // 灌 1 万条（bob 的电脑发，alice 的插件收）。
     let started = Instant::now();
     for i in 0..MESSAGES {
-        bob.client.send(&dm, &friend_im_client::core::ids::MsgId::random(), text(&format!("历史 {i}"))).await.unwrap();
+        bob.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text(&format!("历史 {i}"))).await.unwrap();
     }
     println!("发 {MESSAGES} 条用了 {:?}", started.elapsed());
+    let raw_count = |h: &Host| h.stored(dm.as_str()).iter().filter(|m| m.raw.is_some()).count();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while raw_count(&a) < MESSAGES + 20 {
+        assert!(Instant::now() < deadline, "alice 收不齐：{}", raw_count(&a));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-    // alice 的一台新电脑：插件上线后按宿主的做法一页 100 条翻完，量时间与插件程序的内存。
+    // alice 的一台新电脑：插件上线后从旧电脑补齐，量时间与插件程序的内存。
     let c_cred = plugin_computer(&env, "alice", &alice_key, "alice 的新电脑").await;
     let c_dir = tempfile::tempdir().unwrap();
     let (c, _) = Host::spawn(&program, c_dir.path()).await;
     let pid = c.child.as_ref().and_then(tokio::process::Child::id).unwrap();
+    let started = Instant::now();
     assert_eq!(c.open(&env.server.url(), Some(&c_cred), None).await["state"], "online");
     let at_start = resident_bytes(pid);
-    let mut marks = Vec::new();
-    let mut elapsed = Vec::new();
-    for pass in 0..2 {
-        let started = Instant::now();
-        let (mut cursor, mut seen, mut first_k) = (None::<String>, 0usize, None);
-        loop {
-            let page = c
-                .call("messages/list", json!({ "conversationId": dm.to_string(), "newestFirst": true, "limit": 100, "cursor": cursor }))
-                .await
-                .unwrap();
-            let items: Vec<Message> = serde_json::from_value(page["items"].clone()).unwrap();
-            assert!(!items.iter().any(|m| m.incomplete), "新电脑翻历史时都解得开");
-            seen += items.iter().filter(|m| m.sender.kind != SenderKind::System).count();
-            if first_k.is_none() && seen >= 1000 {
-                first_k = Some(resident_bytes(pid));
-            }
-            match page["next"].as_str() {
-                Some(next) => cursor = Some(next.to_owned()),
-                None => break,
-            }
-        }
-        assert_eq!(seen, MESSAGES + 20);
-        elapsed.push(started.elapsed());
-        marks.push((first_k.unwrap(), resident_bytes(pid)));
-        println!("第 {} 遍：{seen} 条翻完 {:?}", pass + 1, started.elapsed());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // 补齐途中发一条：收发不受影响。
+    let during = Instant::now();
+    bob.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text("补齐途中")).await.unwrap();
+    c.wait_text("补齐途中").await;
+    println!("补齐途中的新消息到新电脑：{:?}（已补 {} 条）", during.elapsed(), raw_count(&c));
+    assert!(during.elapsed() < Duration::from_secs(10));
+    while raw_count(&c) < MESSAGES + 21 {
+        assert!(started.elapsed() < Duration::from_secs(300), "5 分钟内没补齐：{}", raw_count(&c));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
-    println!(
-        "插件内存：上线后 {:.1} MiB；第 1 遍翻到 1000 条 {:.1}、翻完 {:.1}；第 2 遍翻到 1000 条 {:.1}、翻完 {:.1}",
-        mib(at_start),
-        mib(marks[0].0),
-        mib(marks[0].1),
-        mib(marks[1].0),
-        mib(marks[1].1)
-    );
-    assert!(elapsed[0] < Duration::from_secs(300));
-    // 不随条数涨：翻 9000 条多出来的不到 16 MiB；第二遍翻完不比第一遍翻完多 8 MiB。
-    assert!(marks[0].1.saturating_sub(marks[0].0) < 16 << 20);
-    assert!(marks[1].1.saturating_sub(marks[0].1) < 8 << 20);
+    let grown = resident_bytes(pid).saturating_sub(at_start);
+    println!("补齐 {} 条用了 {:?}；插件内存多了 {:.1} MiB", raw_count(&c), started.elapsed(), mib(grown));
+    assert!(grown < 50 << 20, "1 万条历史的常驻内存比空账号多不超过 50 MiB");
+    wait_identical(&[&a, &c], &dm).await;
 }

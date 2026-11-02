@@ -2,21 +2,28 @@
 //!
 //! - [`Cindy`]：扮演两个 Cindy 签发方。自己生成一把 RSA 钥匙，用 HTTP 发公钥（JWKS），给测试签身份凭证。
 //! - [`Server`]：真的 Friend-IM 服务器（临时数据目录），前面挡一个可以随时“断网”的转发代理 [`Proxy`]，能原地重启。
-//! - [`Peer`]：一台电脑 = 真的客户端库 + 它的更新流，`wait` 等到某个更新为止。
+//! - [`Peer`]：一台电脑 = 真的客户端库 + 真的对账引擎 + 内存宿主（[`MemHost`]，这台电脑的聊天记录）。
+//!   `wait` 等到某个更新为止，`wait_text` 等到宿主里有某条消息。
 //! - [`Raw`]：绕过客户端库直接发协议请求，测服务器对坏请求的拒绝。
 
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use friend_im_client::core::bytes;
-use friend_im_client::core::message::{Content, Part};
-use friend_im_client::core::wire::{self, ClientFrame, HelloAuth, Push, Request, Response, ServerFrame, Welcome, WireError};
+use friend_im_client::core::ids::{ConvId, DeviceId, MsgId};
 use friend_im_client::core::keys::RecoveryKey;
-use friend_im_client::{Client, ClientError, Config as ClientConfig, Credentials, Message, Update, Updates};
+use friend_im_client::core::message::{Content, Part};
+use friend_im_client::core::reading::ReadingEnvelope;
+use friend_im_client::core::sync::{Key, next_at, raw_digest};
+use friend_im_client::core::wire::{self, ClientFrame, DeviceStatus, HelloAuth, Push, Request, Response, ServerFrame, Welcome, WireError};
+use friend_im_client::peers::{ClientAuthority, Opened};
+use friend_im_client::sync::{Engine, PeerFrame, Store, StoredItem, StoredRecord, SyncError, Write};
+use friend_im_client::{Client, ClientError, Config as ClientConfig, ConvNotice, Credentials, Message, Update, Updates};
 use friend_im_server::config::{Config, Issuer};
 use friend_im_server::{App, router};
 use futures_util::{SinkExt, StreamExt};
@@ -324,8 +331,8 @@ impl Env {
     /// 测功能用的环境：发送频率放宽（限速单独用 [`Env::with_production_limits`] 测），机器快慢不影响结果。
     pub async fn start() -> Self {
         Self::start_with(|c| {
-            c.send_per_second = 10_000;
-            c.send_per_minute = 1_000_000;
+            c.relay_per_second = 10_000;
+            c.relay_per_minute = 1_000_000;
         })
         .await
     }
@@ -359,11 +366,214 @@ impl Env {
     }
 }
 
+/// 宿主库里的一条。
+#[derive(Clone, Debug)]
+pub struct Row {
+    pub at: i64,
+    pub tomb: bool,
+    pub raw: String,
+}
+
+/// 内存宿主：这台电脑的聊天记录。客户端重启后还在，和真的宿主库一样。
+#[derive(Clone, Default)]
+pub struct MemHost {
+    pub db: Arc<Mutex<BTreeMap<ConvId, HashMap<MsgId, Row>>>>,
+}
+
+struct HostStore {
+    host: MemHost,
+    client: Client,
+}
+
+impl Store for HostStore {
+    async fn conversations(&mut self) -> Result<Vec<ConvId>, String> {
+        let mut convs: BTreeSet<ConvId> = self.host.db.lock().unwrap().keys().cloned().collect();
+        if let Ok(summaries) = self.client.convs().await {
+            convs.extend(summaries.into_iter().map(|s| s.conv));
+        }
+        Ok(convs.into_iter().collect())
+    }
+
+    async fn index(&mut self, conv: &ConvId) -> Result<Vec<StoredItem>, String> {
+        let db = self.host.db.lock().unwrap();
+        Ok(db
+            .get(conv)
+            .map(|rows| {
+                rows.iter()
+                    .map(|(id, row)| StoredItem { id: id.clone(), at: row.at, tomb: row.tomb, raw: (!row.tomb).then(|| raw_digest(&row.raw)) })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn records(&mut self, conv: &ConvId, ids: &[MsgId]) -> Result<Vec<StoredRecord>, String> {
+        let db = self.host.db.lock().unwrap();
+        let Some(rows) = db.get(conv) else { return Ok(Vec::new()) };
+        Ok(ids.iter().filter_map(|id| rows.get(id).map(|row| StoredRecord { id: id.clone(), raw: row.raw.clone() })).collect())
+    }
+
+    async fn write(&mut self, conv: &ConvId, writes: Vec<Write>) -> Result<(), String> {
+        let mut db = self.host.db.lock().unwrap();
+        let rows = db.entry(conv.clone()).or_default();
+        for write in writes {
+            let (key, raw, tomb) = match write {
+                Write::Full { key, raw } => (key, raw, false),
+                Write::Tombstone { key, raw } => (key, raw, true),
+            };
+            rows.insert(key.id, Row { at: key.at, tomb, raw });
+        }
+        Ok(())
+    }
+}
+
+enum Command {
+    Send { conv: ConvId, id: MsgId, content: Content, reply: tokio::sync::oneshot::Sender<Result<i64, ClientError>> },
+    Recall { conv: ConvId, target: MsgId, reply: tokio::sync::oneshot::Sender<Result<(), ClientError>> },
+    Reading { conv: ConvId, envelope: ReadingEnvelope },
+}
+
+type Sync = Engine<HostStore, ClientAuthority>;
+
+async fn flush(engine: &mut Sync, client: &Client) {
+    for (to, frame) in engine.drain() {
+        let conv = match &frame {
+            PeerFrame::Sync { conv, .. } | PeerFrame::Want { conv, .. } | PeerFrame::Have { conv, .. } | PeerFrame::Deny { conv } => Some(conv.clone()),
+            _ => None,
+        };
+        match client.send_frame(&to, conv.as_ref(), &frame).await {
+            Ok(true) => {}
+            _ => engine.peer_offline(&to),
+        }
+    }
+}
+
+async fn meet_everyone(engine: &mut Sync, client: &Client, readings: bool) {
+    let Ok(peers) = client.peers().await else { return };
+    for peer in peers {
+        let _ = engine.peer_online(&peer.device).await;
+        if readings {
+            share_readings(engine, client, &peer.device).await;
+        }
+    }
+}
+
+async fn share_readings(engine: &mut Sync, client: &Client, peer: &DeviceId) {
+    let Ok(convs) = engine.store_mut().conversations().await else { return };
+    for conv in convs {
+        let records = client.reading_records(&conv).await;
+        if !records.is_empty() && client.may_share(&conv, peer).await {
+            let _ = client.send_frame(peer, Some(&conv), &PeerFrame::Reading { conv: conv.clone(), records }).await;
+        }
+    }
+}
+
+async fn on_command(engine: &mut Sync, client: &Client, command: Command) {
+    match command {
+        Command::Send { conv, id, content, reply } => {
+            let result = async {
+                let seen = engine.seen_max(&conv).await.map_err(|e| ClientError::state(e.0))?;
+                let at = next_at(client.now_ms().await, seen);
+                let raw = client.seal(&conv, &id, content, at).await?;
+                engine.local(&conv, raw).await.map_err(|e| ClientError::state(e.0))?;
+                Ok(at)
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        Command::Recall { conv, target, reply } => {
+            let result = async {
+                let key: Key = engine.key_of(&conv, &target).await.map_err(|e: SyncError| ClientError::state(e.0))?.ok_or_else(|| ClientError::state("不在本机"))?;
+                let seen = engine.seen_max(&conv).await.map_err(|e| ClientError::state(e.0))?;
+                let at = next_at(client.now_ms().await, seen);
+                let raw = client.seal(&conv, &MsgId::random(), Content::Recall { target: target.clone(), target_at: key.at }, at).await?;
+                let applied = engine.local(&conv, raw).await.map_err(|e| ClientError::state(e.0))?;
+                if applied.rejected > 0 {
+                    return Err(ClientError::state("只能撤回自己的消息"));
+                }
+                Ok(())
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        Command::Reading { conv, envelope } => {
+            for peer in engine.sharing(&conv).await {
+                let _ = client.send_frame(&peer, Some(&conv), &PeerFrame::Reading { conv: conv.clone(), records: vec![envelope.clone()] }).await;
+            }
+        }
+    }
+}
+
+async fn on_update(engine: &mut Sync, client: &Client, events: &tokio::sync::mpsc::UnboundedSender<Update>, update: Update) {
+    match update {
+        Update::Frame { from, frame, .. } => match frame {
+            PeerFrame::Reading { conv, records } => {
+                if client.may_share(&conv, &from).await {
+                    let _ = client.merge_reading(&conv, records).await;
+                }
+            }
+            frame => {
+                let _ = engine.on_frame(&from, frame).await;
+            }
+        },
+        Update::Presence { device, online: true, .. } => {
+            let _ = engine.peer_online(&device).await;
+            share_readings(engine, client, &device).await;
+        }
+        Update::Presence { device, online: false, .. } => engine.peer_offline(&device),
+        update => {
+            match &update {
+                Update::Connected { status: DeviceStatus::Active } | Update::Activated => {
+                    engine.invalidate_all();
+                    meet_everyone(engine, client, true).await;
+                }
+                Update::Disconnected => engine.clear_online(),
+                Update::Conv(notice) if matches!(notice.change, ConvNotice::Created { .. } | ConvNotice::Added { .. } | ConvNotice::JoinedByInvite) => {
+                    if let Ok(peers) = client.peers().await {
+                        for peer in peers {
+                            if client.may_share(&notice.conv, &peer.device).await {
+                                engine.peer_seen(&peer.device);
+                                let _ = engine.sync_with(&peer.device, &notice.conv).await;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let _ = events.send(update);
+        }
+    }
+}
+
+/// 一台电脑的对账任务（和插件的 `devices.rs` 同一个形状）。
+async fn device_loop(client: Client, host: MemHost, mut updates: Updates, mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>, events: tokio::sync::mpsc::UnboundedSender<Update>) {
+    let store = HostStore { host, client: client.clone() };
+    let mut engine = Engine::new(store, ClientAuthority::new(client.clone()));
+    meet_everyone(&mut engine, &client, true).await;
+    flush(&mut engine, &client).await;
+    loop {
+        tokio::select! {
+            biased;
+            command = commands.recv() => {
+                let Some(command) = command else { break };
+                on_command(&mut engine, &client, command).await;
+            }
+            update = updates.recv() => {
+                let Some(update) = update else { break };
+                on_update(&mut engine, &client, &events, update).await;
+            }
+        }
+        flush(&mut engine, &client).await;
+    }
+}
+
 /// 一台电脑。
 pub struct Peer {
     pub client: Client,
     pub name: String,
-    updates: Updates,
+    /// 这台电脑的聊天记录。
+    pub host: MemHost,
+    commands: tokio::sync::mpsc::UnboundedSender<Command>,
+    updates: tokio::sync::mpsc::UnboundedReceiver<Update>,
     /// 收到过、还没被 `wait` 认领的更新。
     backlog: Vec<Update>,
     /// 收到过的全部更新（按顺序）。
@@ -372,18 +582,50 @@ pub struct Peer {
 
 impl Peer {
     pub async fn connect(server: &str, name: &str, creds: Credentials, cindy: Option<String>, position: Option<u64>) -> Result<Self, ClientError> {
+        Self::connect_with(MemHost::default(), server, name, creds, cindy, position).await
+    }
+
+    /// 带着已有的聊天记录连上（插件重启）。
+    pub async fn connect_with(host: MemHost, server: &str, name: &str, creds: Credentials, cindy: Option<String>, position: Option<u64>) -> Result<Self, ClientError> {
         let config = ClientConfig {
             server: server.into(),
             device_name: name.into(),
         };
         let (client, updates) = Client::connect(config, creds, cindy, position).await?;
+        let (commands, commands_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(device_loop(client.clone(), host.clone(), updates, commands_rx, events));
         Ok(Self {
             client,
             name: name.into(),
-            updates,
+            host,
+            commands,
+            updates: events_rx,
             backlog: Vec::new(),
             log: Vec::new(),
         })
+    }
+
+    /// 发一条消息：写进这台电脑的宿主、投给在线设备。返回排序时间。
+    pub async fn send_as(&self, conv: &ConvId, id: &MsgId, content: Content) -> Result<i64, ClientError> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.commands.send(Command::Send { conv: conv.clone(), id: id.clone(), content, reply }).map_err(|_| ClientError::Disconnected)?;
+        answer.await.map_err(|_| ClientError::Disconnected)?
+    }
+
+    /// 撤回自己的一条。
+    pub async fn recall(&self, conv: &ConvId, target: &MsgId) -> Result<(), ClientError> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.commands.send(Command::Recall { conv: conv.clone(), target: target.clone(), reply }).map_err(|_| ClientError::Disconnected)?;
+        answer.await.map_err(|_| ClientError::Disconnected)?
+    }
+
+    /// 把读到这条的位置写下来、交给在线设备。
+    pub async fn mark_read(&self, conv: &ConvId, message: &Message) -> Result<(), ClientError> {
+        if let Some(envelope) = self.client.mark_read(conv, message).await? {
+            let _ = self.commands.send(Command::Reading { conv: conv.clone(), envelope });
+        }
+        Ok(())
     }
 
     /// 等到 `f` 认出的那个更新（先看之前收到、没人认领的）。
@@ -417,24 +659,54 @@ impl Peer {
         }
     }
 
-    /// 等一条文字是 `text` 的消息。
-    pub async fn wait_text(&mut self, text: &str) -> Message {
-        self.wait(&format!("消息「{text}」"), |u| match u {
-            Update::Message(m) if text_of(m).as_deref() == Some(text) => Some(m.clone()),
-            _ => None,
-        })
-        .await
+    /// 宿主里的全部消息（不算墓碑），按所有设备一样的顺序。
+    pub async fn messages_in(&self, conv: &ConvId) -> Vec<Message> {
+        let mut rows: Vec<(i64, MsgId, Row)> = {
+            let db = self.host.db.lock().unwrap();
+            db.get(conv).map(|rows| rows.iter().map(|(id, row)| (row.at, id.clone(), row.clone())).collect()).unwrap_or_default()
+        };
+        rows.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        let mut out = Vec::new();
+        for (_, _, row) in rows {
+            if !row.tomb
+                && let Ok(Opened::Message(message)) = self.client.open_record(conv, &row.raw).await
+            {
+                out.push(message);
+            }
+        }
+        out
     }
 
-    /// 收到过的全部消息。
-    pub fn messages(&self) -> Vec<Message> {
-        self.log
-            .iter()
-            .filter_map(|u| match u {
-                Update::Message(m) => Some(m.clone()),
-                _ => None,
-            })
-            .collect()
+    /// 宿主里这个会话的文字，按顺序。
+    pub async fn texts(&self, conv: &ConvId) -> Vec<String> {
+        self.messages_in(conv).await.iter().filter_map(text_of).collect()
+    }
+
+    /// 这条在宿主里是不是墓碑。
+    pub fn is_recalled(&self, conv: &ConvId, id: &MsgId) -> bool {
+        self.host.db.lock().unwrap().get(conv).and_then(|rows| rows.get(id)).is_some_and(|row| row.tomb)
+    }
+
+    /// 宿主里全部消息，所有会话。
+    pub async fn messages(&self) -> Vec<Message> {
+        let convs: Vec<ConvId> = self.host.db.lock().unwrap().keys().cloned().collect();
+        let mut out = Vec::new();
+        for conv in convs {
+            out.extend(self.messages_in(&conv).await);
+        }
+        out
+    }
+
+    /// 等一条文字是 `text` 的消息进宿主。
+    pub async fn wait_text(&mut self, text: &str) -> Message {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(found) = self.messages().await.into_iter().find(|m| text_of(m).as_deref() == Some(text)) {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "{} 等不到消息「{text}」", self.name);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
     }
 
     /// 最近一次同步位置。
@@ -457,7 +729,7 @@ pub fn text(text: &str) -> Content {
 /// 消息里的文字（多段拼起来）；不是普通消息为空。
 pub fn text_of(message: &Message) -> Option<String> {
     match &message.content {
-        Some(Content::Post { parts, .. }) => Some(
+        Content::Post { parts, .. } => Some(
             parts
                 .iter()
                 .filter_map(|p| match p {

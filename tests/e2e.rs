@@ -1,12 +1,11 @@
 //! 端到端：真的服务器 + 真的客户端库（插件将来走的同一条路），按契约 S1–S13、S16、S19–S22 的服务器链路走一遍；
-//! 再从服务器这一侧验：坏请求被拒且整批不生效、服务器私自改数据会被插件识破、库里和文件目录里找不到明文（契约 §5、§11）。
+//! 再从服务器这一侧验：坏请求被拒且整批不生效、服务器私自改数据会被插件识破、消息和文件从不落到服务器的数据目录（friend-im v10）。
 //!
 //! 每个测试自己起一套假 Cindy + 服务器，互不影响。设 `RUST_LOG=friend_im_server=debug,friend_im_client=debug` 可看日志。
 
 mod common;
 
 use std::collections::BTreeSet;
-use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -15,12 +14,13 @@ use friend_im_client::core::bytes::{self, Bytes, Fixed};
 use friend_im_client::core::conv::{self, ConvChange, ConvKind, ConvLink, ConvLinkBody, GroupProfile, MemberRef, RemoveReason, Via};
 use friend_im_client::core::crypto;
 use friend_im_client::core::ids::{ConvId, MsgId, Uid};
+use friend_im_client::core::peer::SealedFrame;
 use friend_im_client::core::keys::{AccountSeed, ConvSeed, DeviceSecret, RecoveryKey, account_seed_info, conv_seed_info};
 use friend_im_client::core::limits;
-use friend_im_client::core::message::{Content, Envelope, Part};
+use friend_im_client::core::message::{Content, Part};
 use friend_im_client::core::wire::{AccountKeyBundle, DeviceKeyBox, DeviceStatus, ErrorCode, JoinCloseReason, Request, Response};
 use friend_im_client::core::words::JoinCode;
-use friend_im_client::{AccountNotice, ClientError, ConvNotice, Credentials, FriendLink, HistoryItem, InviteLink, Notice, Update};
+use friend_im_client::{AccountNotice, ClientError, ConvNotice, Credentials, FriendLink, InviteLink, Notice, Update};
 use rusqlite::params;
 use serde_json::json;
 
@@ -38,7 +38,7 @@ async fn me(peer: &Peer) -> MemberRef {
 
 async fn send(peer: &Peer, conv: &ConvId, body: &str) -> MsgId {
     let id = MsgId::random();
-    peer.client.send(conv, &id, text(body)).await.unwrap_or_else(|e| panic!("{} 发「{body}」失败：{e}", peer.name));
+    peer.send_as(conv, &id, text(body)).await.unwrap_or_else(|e| panic!("{} 发「{body}」失败：{e}", peer.name));
     id
 }
 
@@ -50,14 +50,17 @@ async fn wait_notice(peer: &mut Peer, conv: &ConvId, what: &str, f: impl Fn(&Con
     .await
 }
 
-fn texts(items: &[HistoryItem]) -> Vec<String> {
-    items
-        .iter()
-        .filter_map(|i| match i {
-            HistoryItem::Message(m) => text_of(m),
-            _ => None,
-        })
-        .collect()
+/// 等这台电脑的宿主里这个会话的文字正好是这些（对账补齐是异步的）。
+async fn wait_texts(peer: &Peer, conv: &ConvId, expected: &[&str]) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let got = peer.texts(conv).await;
+        if got == expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{} 等不到 {expected:?}，现在是 {got:?}", peer.name);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
 }
 
 fn wrong_code(right: &JoinCode) -> JoinCode {
@@ -111,7 +114,6 @@ async fn first_computer_provisions_and_second_joins_with_four_words() {
     let mut pc2 = env.device("alice", "笔记本").await;
     pc2.wait("连上（待批准）", |u| matches!(u, Update::Connected { status: DeviceStatus::Pending }).then_some(())).await;
     assert!(pc2.client.convs().await.is_err());
-    assert!(pc2.client.history(&dm, None, 50).await.is_err());
     let started = pc2.client.join_start().await.unwrap();
     let words = started.code;
     assert_eq!(words.as_str().split(' ').count(), 4);
@@ -144,12 +146,11 @@ async fn first_computer_provisions_and_second_joins_with_four_words() {
     let convs = pc2.client.convs().await.unwrap();
     assert!(convs.iter().any(|c| c.conv == dm && c.member));
     assert!(approving.elapsed() < Duration::from_secs(30));
-    let page = pc2.client.history(&dm, None, 50).await.unwrap();
-    assert_eq!(texts(&page.items), ["加电脑前的第 3 条", "加电脑前的第 2 条", "加电脑前的第 1 条"]);
-    assert!(!page.items.iter().any(|i| matches!(i, HistoryItem::Rejected { .. })));
+    wait_texts(&pc2, &dm, &["加电脑前的第 1 条", "加电脑前的第 2 条", "加电脑前的第 3 条"]).await;
+    let notices = pc2.client.notices(&dm).await.unwrap();
     assert!(matches!(
-        page.items.last(),
-        Some(HistoryItem::Notice(Notice { change: ConvNotice::Created { kind: ConvKind::Dm, via: Some(Via::FriendLink), .. }, .. }))
+        notices.first(),
+        Some(Notice { change: ConvNotice::Created { kind: ConvKind::Dm, via: Some(Via::FriendLink), .. }, .. })
     ));
 
     // S4：本账号所有电脑都收到“新增了电脑”。
@@ -212,13 +213,13 @@ async fn recovery_key_joins_replacement_kills_old_key_and_logout_removes_compute
     let dm = approved_dm(&bob.client, &pc1.client).await;
     send(&bob, &dm, "恢复前的消息").await;
 
-    // S3：新电脑用恢复密钥加入（12 个词），不需要旧电脑；以前的消息照样看得到。
+    // S3：新电脑用恢复密钥加入（12 个词）：账号不用旧电脑批准；以前的消息要等另一台设备或聊天对象在线才补得到。
     let mut pc2 = env.device("alice", "笔记本").await;
     pc2.client.join_with_recovery(&recovery.to_words()).await.unwrap();
     pc2.wait("可用", |u| matches!(u, Update::Activated).then_some(())).await;
     pc1.wait("新增电脑的提醒", |u| matches!(u, Update::Account { notice: AccountNotice::DeviceAdded { name, .. }, .. } if name == "笔记本").then_some(()))
         .await;
-    assert_eq!(texts(&pc2.client.history(&dm, None, 10).await.unwrap().items), ["恢复前的消息"]);
+    wait_texts(&pc2, &dm, &["恢复前的消息"]).await;
 
     // 抄错一个词：校验发现，不会登错。
     let mut pc3 = env.device("alice", "平板").await;
@@ -236,7 +237,7 @@ async fn recovery_key_joins_replacement_kills_old_key_and_logout_removes_compute
     assert!(matches!(err, ClientError::State(_)), "旧恢复密钥应被拒：{err}");
     pc3.client.join_with_recovery(&replaced.to_groups()).await.unwrap();
     pc3.wait("可用", |u| matches!(u, Update::Activated).then_some(())).await;
-    assert_eq!(texts(&pc3.client.history(&dm, None, 10).await.unwrap().items), ["恢复前的消息"]);
+    wait_texts(&pc3, &dm, &["恢复前的消息"]).await;
     // 换代后的消息三台都读得到（换恢复密钥时账号钥匙换了一代）。
     send(&bob, &dm, "换恢复密钥之后").await;
     for pc in [&mut pc1, &mut pc2, &mut pc3] {
@@ -312,10 +313,9 @@ async fn reset_starts_over_leaves_groups_and_friends_see_it() {
     wait_notice(&mut bob, &dm, "私聊里的重置提示", |c| matches!(c, ConvNotice::MemberReset { uid } if uid == &alice_uid)).await;
     wait_notice(&mut fresh, &dm, "私聊里的重置提示", |c| matches!(c, ConvNotice::MemberReset { uid } if uid == &alice_uid)).await;
     fresh.wait_text("重置后的私聊").await;
-    // 以前的消息读不出来。
-    let page = fresh.client.history(&dm, None, 50).await.unwrap();
-    assert_eq!(texts(&page.items), ["重置后的私聊"]);
-    assert!(page.items.iter().any(|i| matches!(i, HistoryItem::Rejected { .. })), "重置前的那条解不开");
+    // 以前的消息读不出来：对账时验不过，不进宿主。
+    bob.settle(Duration::from_millis(300)).await;
+    assert_eq!(fresh.texts(&dm).await, ["重置后的私聊"]);
 
     // 群：已经退出；群里下一次发消息前把她移出并换代，她读不到之后的消息、也发不了。
     let convs = fresh.client.convs().await.unwrap();
@@ -337,9 +337,8 @@ async fn reset_starts_over_leaves_groups_and_friends_see_it() {
     assert_eq!(after_leave, 0);
     fresh.settle(Duration::from_millis(300)).await;
     assert!(!fresh.log.iter().any(|u| matches!(u, Update::ConvRejected { .. })), "{:#?}", fresh.log);
-    let page = fresh.client.history(&group, None, 50).await.unwrap();
-    assert!(texts(&page.items).is_empty());
-    assert!(fresh.client.send(&group, &MsgId::random(), text("我还在吗")).await.is_err());
+    assert!(fresh.texts(&group).await.is_empty());
+    assert!(fresh.send_as(&group, &MsgId::random(), text("我还在吗")).await.is_err());
 
     // 需要别人重新邀请：bob 邀请回来，又能在群里聊天。
     bob.client.invite(&group, std::slice::from_ref(&alice_uid)).await.unwrap();
@@ -394,57 +393,31 @@ async fn friends_groups_and_every_message_kind() {
         parts: vec![Part::Mention { uid: Some(uid(&bob)), name: Some("bob".into()), everyone: false }, Part::Text { text: " 在吗".into() }],
         reply_to: Some(hello.clone()),
     };
-    alice.client.send(&dm, &MsgId::random(), mention.clone()).await.unwrap();
+    alice.send_as(&dm, &MsgId::random(), mention.clone()).await.unwrap();
     let got = bob.wait_text(" 在吗").await;
-    assert_eq!(got.content, Some(mention));
+    assert_eq!(got.content, mention);
     assert_eq!(got.sender, uid(&alice));
-    // 同一次发送重试：服务器上只有一条，回同一个序号。
+    // 同一次发送重试：所有设备上只有一条。
     let retry = MsgId::random();
-    let first_try = alice.client.send(&dm, &retry, text("只出现一次")).await.unwrap();
-    let second_try = alice.client.send(&dm, &retry, text("只出现一次")).await.unwrap();
-    assert_eq!(first_try, second_try);
-    // 图片（多段）和文件（跨两段上传请求，> 8 MiB）。
-    let image: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
-    let image_ref = alice.client.upload(&dm, Cursor::new(image.clone()), image.len() as u64, "照片.png", "image/png").await.unwrap();
-    let big: Vec<u8> = (0..(9 * 1024 * 1024 + 123)).map(|i: u32| (i % 253) as u8).collect();
-    let big_ref = alice.client.upload(&dm, Cursor::new(big.clone()), big.len() as u64, "资料.zip", "application/zip").await.unwrap();
-    let parts = vec![
-        Part::Image { file: image_ref.clone(), width: Some(640), height: Some(480) },
-        Part::File { file: big_ref.clone() },
-        Part::Text { text: "图和文件".into() },
-    ];
-    alice.client.send(&dm, &MsgId::random(), Content::Post { parts, reply_to: None }).await.unwrap();
-    let got = bob.wait_text("图和文件").await;
-    let Some(Content::Post { parts, .. }) = got.content else { panic!("应是普通消息") };
-    let (Part::Image { file: got_image, .. }, Part::File { file: got_big }) = (&parts[0], &parts[1]) else { panic!("图和文件") };
-    let mut out = Vec::new();
-    bob.client.download(got_image, &mut out).await.unwrap();
-    assert_eq!(out, image);
-    let mut out = Vec::new();
-    bob.client.download(got_big, &mut out).await.unwrap();
-    assert_eq!(out.len(), big.len());
-    assert!(out == big);
-    // 钥匙不对（服务器换了文件内容也一样）：解不开。
-    let mut wrong = got_image.clone();
-    wrong.key = Fixed([9; 32]);
-    assert!(bob.client.download(&wrong, &mut Vec::new()).await.is_err());
-    // 撤回：对方收到撤回，翻历史时原消息已没有内容，服务器上的密文也删了。
+    alice.send_as(&dm, &retry, text("只出现一次")).await.unwrap();
+    alice.send_as(&dm, &retry, text("只出现一次")).await.unwrap();
+    // 撤回：两边都变成墓碑，撤回的不会回来。
     let oops = send(&alice, &dm, "发错了").await;
     bob.wait_text("发错了").await;
-    alice.client.recall(&dm, &MsgId::random(), &oops).await.unwrap();
-    bob.wait("撤回", |u| matches!(u, Update::Message(m) if m.content == Some(Content::Recall { target: oops.clone() })).then_some(())).await;
-    let page = bob.client.history(&dm, None, 50).await.unwrap();
-    assert!(page.items.iter().any(|i| matches!(i, HistoryItem::Message(m) if m.id == oops && m.recalled())));
-    let ct: String = env.server.db().query_row("SELECT env FROM messages WHERE msg = ?1", params![oops.as_str()], |r| r.get(0)).unwrap();
-    assert_eq!(serde_json::from_str::<Envelope>(&ct).unwrap().ct.len(), 0);
+    alice.recall(&dm, &oops).await.unwrap();
+    eventually("bob 看到撤回", async || bob.is_recalled(&dm, &oops).then_some(())).await;
+    assert!(alice.is_recalled(&dm, &oops));
+    assert!(!bob.texts(&dm).await.contains(&"发错了".to_owned()));
     // 不能撤回别人的消息。
-    assert_eq!(code(&bob.client.recall(&dm, &MsgId::random(), &hello).await.unwrap_err()), Some(ErrorCode::Forbidden));
+    assert!(matches!(bob.recall(&dm, &hello).await.unwrap_err(), ClientError::State(_)));
     bob.settle(Duration::from_millis(300)).await;
-    assert_eq!(bob.messages().iter().filter(|m| text_of(m).as_deref() == Some("只出现一次")).count(), 1);
+    assert!(!alice.is_recalled(&dm, &hello), "伪造的撤回不生效");
+    assert_eq!(bob.texts(&dm).await.iter().filter(|t| *t == "只出现一次").count(), 1);
 
     // S11：新建群：成员是认识的人；群名只有成员看得到。
     approved_dm(&carol.client, &alice.client).await;
-    let profile = GroupProfile { name: "周末爬山".into(), description: "每周六早上".into(), avatar: Some(image_ref.clone()) };
+    let photo = friend_im_client::core::file::FileRef { id: friend_im_client::core::ids::FileId::random(), key: Fixed([1; 32]), size: 4, name: "群头像.png".into(), mime: "image/png".into(), sha256: None };
+    let profile = GroupProfile { name: "周末爬山".into(), description: "每周六早上".into(), avatar: Some(photo) };
     let group = alice.client.create_group(&profile, &[uid(&bob), uid(&carol)]).await.unwrap();
     let alice_uid = uid(&alice);
     let expected: BTreeSet<Uid> = [uid(&alice), uid(&bob), uid(&carol)].into();
@@ -461,7 +434,7 @@ async fn friends_groups_and_every_message_kind() {
         parts: vec![Part::Mention { uid: None, name: None, everyone: true }, Part::Text { text: " 群里第一条".into() }],
         reply_to: None,
     };
-    alice.client.send(&group, &MsgId::random(), everyone).await.unwrap();
+    alice.send_as(&group, &MsgId::random(), everyone).await.unwrap();
     bob.wait_text(" 群里第一条").await;
     carol.wait_text(" 群里第一条").await;
 
@@ -480,7 +453,7 @@ async fn friends_groups_and_every_message_kind() {
         let notice = wait_notice(peer, &group, "邀请提示", |c| matches!(c, ConvNotice::Added { .. })).await;
         assert_eq!(notice.author, uid(&carol));
     }
-    assert_eq!(texts(&dave.client.history(&group, None, 50).await.unwrap().items), [" 群里第一条"]);
+    wait_texts(&dave, &group, &[" 群里第一条"]).await;
     assert_eq!(dave.client.group_profile(&group).await.unwrap().map(|p| p.name), Some("周末爬山".into()));
     // 群邀请链接：凭链接加入，不用等成员在线。
     let invite = alice.client.create_invite_link(&group).await.unwrap();
@@ -489,7 +462,7 @@ async fn friends_groups_and_every_message_kind() {
     let joined = erin.client.join_by_invite(&InviteLink::parse(&invite_text).unwrap()).await.unwrap();
     assert_eq!(joined, group);
     wait_notice(&mut bob, &group, "凭链接加入", |c| matches!(c, ConvNotice::JoinedByInvite)).await;
-    assert_eq!(texts(&erin.client.history(&group, None, 50).await.unwrap().items), [" 群里第一条"]);
+    wait_texts(&erin, &group, &[" 群里第一条"]).await;
 
     // S13：只有群主能移出；移出后对方保留之前的、读不到之后的，也发不了。
     assert!(bob.client.kick(&group, &uid(&erin)).await.is_err());
@@ -500,19 +473,14 @@ async fn friends_groups_and_every_message_kind() {
     send(&alice, &group, "移出 dave 之后").await;
     bob.wait_text("移出 dave 之后").await;
     erin.wait_text("移出 dave 之后").await;
-    let dave_view = dave.client.history(&group, None, 50).await.unwrap();
-    assert_eq!(texts(&dave_view.items), [" 群里第一条"]);
+    assert_eq!(dave.texts(&group).await, [" 群里第一条"]);
     assert!(dave.client.convs().await.unwrap().iter().any(|c| c.conv == group && !c.member));
-    assert!(dave.client.send(&group, &MsgId::random(), text("还能发吗")).await.is_err());
+    assert!(dave.send_as(&group, &MsgId::random(), text("还能发吗")).await.is_err());
     dave.settle(Duration::from_millis(300)).await;
-    assert!(!dave.messages().iter().any(|m| text_of(m).as_deref() == Some("移出 dave 之后")));
+    assert!(!dave.texts(&group).await.contains(&"移出 dave 之后".to_owned()), "被移出的人从任何路径都拿不到之后的");
     // 群里换过代之后凭旧链接加入的人：拿到的是发邀请时那一代，别的成员自动补发当前一代，照样读得到新消息。
     frank.client.join_by_invite(&InviteLink::parse(&invite_text).unwrap()).await.unwrap();
-    eventually("frank 拿到当前一代钥匙", async || {
-        let page = frank.client.history(&group, None, 50).await.ok()?;
-        texts(&page.items).contains(&"移出 dave 之后".to_string()).then_some(())
-    })
-    .await;
+    eventually("frank 拿到当前一代钥匙和以前的消息", async || frank.texts(&group).await.contains(&"移出 dave 之后".to_string()).then_some(())).await;
     send(&frank, &group, "frank 来了").await;
     alice.wait_text("frank 来了").await;
     // 作废链接后不能再凭它加入。
@@ -524,16 +492,12 @@ async fn friends_groups_and_every_message_kind() {
     wait_notice(&mut alice, &group, "退群提示", |c| matches!(c, ConvNotice::Left)).await;
     send(&alice, &group, "carol 走了之后").await;
     bob.wait_text("carol 走了之后").await;
-    assert!(!texts(&carol.client.history(&group, None, 50).await.unwrap().items).contains(&"carol 走了之后".to_string()));
+    assert!(!carol.texts(&group).await.contains(&"carol 走了之后".to_string()));
     // 退群的人凭新的群邀请链接回来：她手里那份签名链停在退群时，要先用邀请回执补齐之后的环再签加入。
     let again = alice.client.create_invite_link(&group).await.unwrap();
     carol.client.join_by_invite(&InviteLink::parse(&again.to_string()).unwrap()).await.unwrap();
     wait_notice(&mut alice, &group, "退群的人凭链接回来", |c| matches!(c, ConvNotice::JoinedByInvite)).await;
-    eventually("carol 回来后读得到当前一代的消息", async || {
-        let page = carol.client.history(&group, None, 50).await.ok()?;
-        texts(&page.items).contains(&"carol 走了之后".to_string()).then_some(())
-    })
-    .await;
+    eventually("carol 回来后读得到当前一代的消息", async || carol.texts(&group).await.contains(&"carol 走了之后".to_string()).then_some(())).await;
     send(&alice, &group, "carol 回来之后").await;
     carol.wait_text("carol 回来之后").await;
     // 改群名：成员看得到新的。
@@ -542,135 +506,12 @@ async fn friends_groups_and_every_message_kind() {
     wait_notice(&mut alice, &group, "改群资料提示", |c| matches!(c, ConvNotice::ProfileChanged)).await;
     assert_eq!(alice.client.group_profile(&group).await.unwrap(), Some(renamed));
 
-    // 每个人收到的每条消息只有一次。
-    for peer in [&mut alice, &mut bob, &mut erin] {
-        peer.settle(Duration::from_millis(300)).await;
-        let ids: Vec<MsgId> = peer.messages().into_iter().map(|m| m.id).collect();
-        let unique: BTreeSet<&MsgId> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "{} 收到了重复的消息", peer.name);
-    }
-}
-
-// ---------- 文件断点续传：上传、下载到一半断了，从断的地方接着传 ----------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn interrupted_file_transfers_resume_where_they_stopped() {
-    let env = Env::start().await;
-    let (alice, _) = env.account("alice", "alice 的电脑").await;
-    let (mut bob, _) = env.account("bob", "bob 的电脑").await;
-    let dm = approved_dm(&bob.client, &alice.client).await;
-    let data: Vec<u8> = (0..(20 * 1024 * 1024 + 7)).map(|i: u32| (i.wrapping_mul(31) % 251) as u8).collect();
-    // 第一段请求传到 3 MiB 时连接被掐：客户端问服务器收到哪里，从那里接着传。
-    env.server.proxy.cut_once_after(3 * 1024 * 1024);
-    let file = alice
-        .client
-        .upload(&dm, Cursor::new(data.clone()), data.len() as u64, "大文件.bin", "application/octet-stream")
-        .await
-        .unwrap();
-    assert!(env.server.proxy.tripped(), "上传途中确实断过");
-    // 下载到 5 MiB 时断：按收到的位置续下，内容一字不差。
-    env.server.proxy.cut_once_after(5 * 1024 * 1024);
-    let mut out = Vec::new();
-    bob.client.download(&file, &mut out).await.unwrap();
-    assert!(env.server.proxy.tripped(), "下载途中确实断过");
-    assert_eq!(out.len(), data.len());
-    assert!(out == data);
-    // 断的只是传文件的那条连接：长连接照常收发。
-    send(&alice, &dm, "文件传完了").await;
-    bob.wait_text("文件传完了").await;
-}
-
-// ---------- 插件接 HHH 用的三种读法：按时间读历史、会话活动、按段读文件 ----------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn history_by_time_activity_and_file_ranges() {
-    let env = Env::start().await;
-    let (mut alice, _) = env.account("alice", "alice 的电脑").await;
-    let (mut bob, _) = env.account("bob", "bob 的电脑").await;
-    let (carol, _) = env.account("carol", "carol 的电脑").await;
-    let dm = approved_dm(&bob.client, &alice.client).await;
-    wait_notice(&mut alice, &dm, "新私聊", |c| matches!(c, ConvNotice::Created { .. })).await;
-    // 五条消息，服务器时间各不相同。
-    let mut sent = Vec::new();
-    for i in 0..5 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let (log, ts) = alice.client.send(&dm, &MsgId::random(), text(&format!("第{i}条"))).await.unwrap();
-        sent.push((log, ts));
-    }
-    let ts = |i: usize| sent[i].1;
-    let read = async |since: Option<i64>, until: Option<i64>| {
-        let page = bob.client.history_in(&dm, None, 100, since, until).await.unwrap();
-        (texts(&page.items), page.more)
-    };
-    let names = |r: std::ops::RangeInclusive<usize>| r.rev().map(|i| format!("第{i}条")).collect::<Vec<_>>();
-    // 两端都含；只给一端；窗口里没有消息时是空的、没有更多。
-    assert_eq!(read(Some(ts(1)), Some(ts(3))).await, (names(1..=3), false));
-    assert_eq!(read(Some(ts(3)), None).await, (names(3..=4), false));
-    assert_eq!(read(None, Some(ts(1))).await.0, names(0..=1));
-    assert_eq!(read(Some(ts(4) + 1), None).await, (Vec::new(), false));
-    assert_eq!(read(Some(ts(0) - 10_000), Some(ts(0) - 1)).await.0, Vec::<String>::new());
-    // 系统提示也按时间筛：私聊建起来的提示早于第一条，只在不限起点时出现。
-    let notices = |items: &[HistoryItem]| items.iter().filter(|i| matches!(i, HistoryItem::Notice(_))).count();
-    assert_eq!(notices(&bob.client.history_in(&dm, None, 100, Some(ts(0)), None).await.unwrap().items), 0);
-    assert_eq!(notices(&bob.client.history_in(&dm, None, 100, None, Some(ts(0))).await.unwrap().items), 1);
-    // 时间窗口和序号游标一起翻：一页两条，翻到窗口起点为止。
-    let mut before = None;
-    let mut pages = Vec::new();
-    loop {
-        let page = bob.client.history_in(&dm, before, 2, Some(ts(1)), None).await.unwrap();
-        pages.push(texts(&page.items));
-        if !page.more {
-            break;
-        }
-        before = page.items.iter().filter(|i| matches!(i, HistoryItem::Message(_))).map(HistoryItem::log).min();
-    }
-    assert_eq!(pages, vec![names(3..=4), names(1..=2)]);
-
-    // 会话活动：只有自己所在的会话、只有编号和时间；窗口起点之后没消息就没有这个会话。
-    let activity = bob.client.activity(ts(0)).await.unwrap();
-    assert_eq!(activity.len(), 1);
-    assert_eq!((activity[0].conv.clone(), activity[0].first_ms, activity[0].latest_ms), (dm.clone(), ts(0), ts(4)));
-    assert_eq!(bob.client.activity(ts(1)).await.unwrap()[0].first_ms, ts(1));
-    assert!(bob.client.activity(ts(4) + 1).await.unwrap().is_empty());
-    assert!(carol.client.activity(0).await.unwrap().is_empty(), "不是成员看不到别人的会话活动");
-    // 退了群的人：只算退群之前的。
-    let group = alice
-        .client
-        .create_group(&GroupProfile { name: "爬山".into(), ..Default::default() }, &[bob.client.uid().clone()])
-        .await
-        .unwrap();
-    wait_notice(&mut bob, &group, "建群", |c| matches!(c, ConvNotice::Created { .. })).await;
-    let (_, before_leave) = bob.client.send(&group, &MsgId::random(), text("走之前")).await.unwrap();
-    bob.client.leave(&group).await.unwrap();
-    wait_notice(&mut alice, &group, "退群", |c| matches!(c, ConvNotice::Left)).await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let (_, after_leave) = alice.client.send(&group, &MsgId::random(), text("走之后")).await.unwrap();
-    let mine = bob.client.activity(before_leave).await.unwrap();
-    let seen = mine.iter().find(|a| a.conv == group).expect("退群前的活动还在");
-    assert_eq!(seen.latest_ms, before_leave, "退群之后的消息不算");
-    assert!(after_leave > before_leave);
-    assert_eq!(alice.client.activity(after_leave).await.unwrap().iter().map(|a| a.conv.clone()).collect::<Vec<_>>(), vec![group]);
-
-    // 按段读文件：跨两块、正好一块、文件尾、超出文件尾；内容与原文一致。
-    let data: Vec<u8> = (0..(200 * 1024 + 13)).map(|i: u32| (i.wrapping_mul(7) % 253) as u8).collect();
-    let file = alice
-        .client
-        .upload(&dm, Cursor::new(data.clone()), data.len() as u64, "段.bin", "application/octet-stream")
-        .await
-        .unwrap();
-    let chunk = 64 * 1024u64;
-    let size = data.len() as u64;
-    for (offset, len) in [(0, 100), (chunk - 10, 20), (chunk, chunk), (3 * chunk - 1, 1024 * 1024), (size - 5, 100), (0, size)] {
-        let got = bob.client.read_range(&file, offset, len).await.unwrap();
-        let end = (offset + len).min(size);
-        assert!(got == data[offset as usize..end as usize], "读 {offset}+{len} 不对");
-    }
-    assert!(bob.client.read_range(&file, size, 10).await.unwrap().is_empty());
-    assert!(bob.client.read_range(&file, 0, 1024 * 1024 + 1).await.is_err(), "一次至多 1 MiB");
-    // 文件钥匙不对：解不开，不会给出乱码。
-    let mut wrong = file.clone();
-    wrong.key = Fixed([9; 32]);
-    assert!(bob.client.read_range(&wrong, chunk, 10).await.is_err());
+    // 所有在群里的人，消息逐条一样、顺序一样。
+    eventually("三个人一模一样", async || {
+        let reference = alice.texts(&group).await;
+        (bob.texts(&group).await == reference && erin.texts(&group).await == reference).then_some(())
+    })
+    .await;
 }
 
 // ---------- S19：断网、服务器停了：恢复后补收，不丢不重 ----------
@@ -689,46 +530,44 @@ async fn reconnects_and_catches_up_without_loss_or_duplicates() {
 
     env.server.proxy.cut();
     bob.wait("断开", |u| matches!(u, Update::Disconnected).then_some(())).await;
-    // 断开时发送直接失败，不会自动重发（由用户在失败记录里重试）。
+    // 断开时也能发：本机保存了就算发出，等对账送达。
     let pending = MsgId::random();
-    assert!(matches!(bob.client.send(&dm, &pending, text("断网时发的")).await.unwrap_err(), ClientError::Disconnected));
+    bob.send_as(&dm, &pending, text("断网时发的")).await.unwrap();
     for i in 0..30 {
         send(&alice, &dm, &format!("断网期间 {i}")).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     env.server.proxy.restore();
     bob.wait("重新连上", |u| matches!(u, Update::Connected { status: DeviceStatus::Active }).then_some(())).await;
+    alice.wait_text("断网时发的").await;
     for i in 0..30 {
         bob.wait_text(&format!("断网期间 {i}")).await;
     }
-    bob.settle(Duration::from_millis(500)).await;
-    let during: Vec<String> = bob.messages().iter().filter_map(text_of).filter(|t| t.starts_with("断网期间")).collect();
+    eventually("两边一模一样", async || (alice.texts(&dm).await == bob.texts(&dm).await).then_some(())).await;
+    let during: Vec<String> = bob.texts(&dm).await.into_iter().filter(|t| t.starts_with("断网期间")).collect();
     assert_eq!(during, (0..30).map(|i| format!("断网期间 {i}")).collect::<Vec<_>>(), "按顺序、每条一次");
-    // 用户在失败记录里重试：同一个编号，服务器上只有一条。
-    let a = bob.client.send(&dm, &pending, text("断网时发的")).await.unwrap();
-    let b = bob.client.send(&dm, &pending, text("断网时发的")).await.unwrap();
-    assert_eq!(a, b);
-    alice.wait_text("断网时发的").await;
-    bob.wait_text("断网时发的").await;
+    // 用户在失败记录里重试：同一个编号只有一条。
+    bob.send_as(&dm, &pending, text("断网时发的")).await.unwrap();
     bob.settle(Duration::from_millis(300)).await;
+    assert_eq!(alice.texts(&dm).await.iter().filter(|t| *t == "断网时发的").count(), 1);
 
-    // 关掉插件，带着存下的同步位置重新打开：只补收关着的这段时间的。
+    // 关掉插件，带着聊天记录和同步位置重新打开：补收关着的这段时间的。
     let position = bob.position().expect("有同步位置");
     let creds = bob.client.credentials().await;
+    let host = bob.host.clone();
     bob.client.close();
     for i in 0..5 {
         send(&alice, &dm, &format!("关着的时候 {i}")).await;
     }
-    let mut reopened = Peer::connect(&env.server.url(), "bob 的电脑", creds, None, Some(position)).await.unwrap();
+    let mut reopened = Peer::connect_with(host, &env.server.url(), "bob 的电脑", creds, None, Some(position)).await.unwrap();
     for i in 0..5 {
         reopened.wait_text(&format!("关着的时候 {i}")).await;
     }
-    reopened.settle(Duration::from_millis(500)).await;
-    assert_eq!(reopened.messages().len(), 5, "之前收过的不再推一遍");
+    eventually("重开后一模一样", async || (alice.texts(&dm).await == reopened.texts(&dm).await).then_some(())).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn server_restart_keeps_everything_and_clients_reconnect() {
+async fn server_restart_changes_nothing_because_it_keeps_no_messages() {
     let mut env = Env::start().await;
     let (mut alice, _) = env.account("alice", "alice 的电脑").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
@@ -742,7 +581,7 @@ async fn server_restart_keeps_everything_and_clients_reconnect() {
     bob.wait("重新连上", |u| matches!(u, Update::Connected { status: DeviceStatus::Active }).then_some(())).await;
     send(&alice, &dm, "重启后").await;
     bob.wait_text("重启后").await;
-    assert_eq!(texts(&bob.client.history(&dm, None, 10).await.unwrap().items), ["重启后", "重启前"]);
+    assert_eq!(bob.texts(&dm).await, ["重启前", "重启后"]);
 }
 
 // ---------- S20、S21：拒绝、取消、连续输错 5 次 ----------
@@ -903,11 +742,8 @@ async fn forged_members_devices_and_keys_are_rejected() {
     let bob_creds = bob.client.credentials().await;
     let mallory_creds = mallory.client.credentials().await;
 
-    // 非成员读不到会话的任何东西，也下不了文件。
-    assert_eq!(code_of(mallory.client.history(&dm, None, 10).await), Some(ErrorCode::Forbidden));
+    // 非成员读不到会话的任何东西。
     assert_eq!(code_of(mallory.client.conv_info(&group).await), Some(ErrorCode::Forbidden));
-    let file = alice.client.upload(&dm, Cursor::new(b"secret".to_vec()), 6, "a.txt", "text/plain").await.unwrap();
-    assert!(matches!(mallory.client.download(&file, &mut Vec::new()).await.unwrap_err(), ClientError::Transfer(_)));
     assert!(mallory.client.invite(&group, std::slice::from_ref(&mallory_ref.uid)).await.is_err());
 
     // 绕过客户端直接发请求：非成员把自己签进群——服务器拒绝。
@@ -921,20 +757,27 @@ async fn forged_members_devices_and_keys_are_rejected() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Forbidden);
 
-    // 冒充别人发消息、抢别人的消息编号、超大消息——服务器拒绝。
+    // 转交：只能用自己这台电脑发；发给别的账号要说明会话、双方都是现在的成员。冒充别的设备、发给非成员一律被拒。
     let (mut raw_alice, _) = Raw::connect(&env.server.url(), &alice_creds, "alice 的电脑").await;
-    let seed = ConvSeed::generate();
-    let sender = friend_im_client::core::message::Sender { uid: &bob_ref.uid, eldest: bob_ref.eldest, device: &alice_creds.device };
-    let body = friend_im_client::core::message::MessageBody { v: 1, ctime_ms: 1, content: text("我是 bob") };
-    let impostor = Envelope::seal(&dm, MsgId::random(), 1, &seed, &sender, &body).unwrap();
-    assert_eq!(raw_alice.request(Request::Send { env: impostor }).await.unwrap_err().code, ErrorCode::Forbidden);
-    let (mut raw_bob, _) = Raw::connect(&env.server.url(), &bob_creds, "bob 的电脑").await;
-    let sender = friend_im_client::core::message::Sender { uid: &bob_ref.uid, eldest: bob_ref.eldest, device: &bob_creds.device };
-    let stolen = Envelope::seal(&dm, hello.clone(), 1, &seed, &sender, &body).unwrap();
-    assert_eq!(raw_bob.request(Request::Send { env: stolen }).await.unwrap_err().code, ErrorCode::Conflict);
-    let mut huge = Envelope::seal(&dm, MsgId::random(), 1, &seed, &sender, &body).unwrap();
-    huge.ct = Bytes(vec![0; 90 * 1024]);
-    assert_eq!(raw_bob.request(Request::Send { env: huge }).await.unwrap_err().code, ErrorCode::LimitExceeded);
+    // bob 本人也开着，转交给它的帧都送到。
+    let (_raw_bob, _) = Raw::connect(&env.server.url(), &bob_creds, "bob 的电脑").await;
+    let (alice_device, bob_device, mallory_device) = (alice_creds.device.id(), bob_creds.device.id(), mallory_creds.device.id());
+    let relay = |to: &friend_im_client::core::ids::DeviceId, conv: Option<&ConvId>, frame: SealedFrame| Request::Relay { to: to.clone(), conv: conv.cloned(), frame };
+    let as_alice = SealedFrame::seal(&alice_ref.uid, &alice_creds.device, &bob_creds.device.public(), b"x").unwrap();
+    assert_eq!(raw_mallory.request(relay(&bob_device, Some(&dm), as_alice.clone())).await.unwrap_err().code, ErrorCode::Forbidden, "冒充别的设备");
+    let from_mallory = SealedFrame::seal(&mallory_ref.uid, &mallory_creds.device, &bob_creds.device.public(), b"x").unwrap();
+    assert_eq!(raw_mallory.request(relay(&bob_device, Some(&dm), from_mallory.clone())).await.unwrap_err().code, ErrorCode::Forbidden, "不是会话成员");
+    assert_eq!(raw_mallory.request(relay(&bob_device, None, from_mallory)).await.unwrap_err().code, ErrorCode::Forbidden, "发给别的账号要说明会话");
+    let to_mallory = SealedFrame::seal(&alice_ref.uid, &alice_creds.device, &mallory_creds.device.public(), b"x").unwrap();
+    assert_eq!(raw_alice.request(relay(&mallory_device, Some(&dm), to_mallory)).await.unwrap_err().code, ErrorCode::Forbidden, "发给非成员");
+    assert_eq!(raw_alice.request(relay(&bob_device, Some(&group), as_alice.clone())).await.unwrap(), Response::Relayed { online: true });
+    // 帧里写的接收设备和要转给的不是同一台：拒绝。
+    assert_eq!(raw_alice.request(relay(&alice_device, None, as_alice)).await.unwrap_err().code, ErrorCode::Forbidden);
+    // 在线设备：只列能对账的。
+    let Response::Peers { peers } = raw_mallory.request(Request::Peers).await.unwrap() else { panic!("在线设备回执") };
+    assert!(peers.is_empty(), "没有共享会话的设备不算对账伙伴：{peers:?}");
+    let Response::Peers { peers } = raw_alice.request(Request::Peers).await.unwrap() else { panic!("在线设备回执") };
+    assert_eq!(peers.into_iter().map(|p| p.device).collect::<Vec<_>>(), [bob_device.clone()]);
 
     // 整批不生效：一个请求里第一环合规、第二环（群主移出却不换代）不合规，两环都不写入。
     let links_before = count(&db, "SELECT COUNT(*) FROM conv_links WHERE conv = ?1", group.as_str());
@@ -983,7 +826,7 @@ async fn forged_members_devices_and_keys_are_rejected() {
         params![group.as_str(), (seq + 1) as i64, serde_json::to_string(&ConvLink::sign(&body, &mallory_creds.device)).unwrap(), 1_000_000i64],
     )
     .unwrap();
-    let err = alice.client.history(&group, None, 10).await.unwrap_err();
+    let err = alice.client.rotate(&group).await.unwrap_err();
     assert!(matches!(err, ClientError::Verify(_)), "应识破服务器加的成员：{err}");
     db.execute("DELETE FROM conv_links WHERE conv = ?1 AND seq = ?2", params![group.as_str(), (seq + 1) as i64]).unwrap();
 
@@ -1013,7 +856,7 @@ async fn forged_members_devices_and_keys_are_rejected() {
     let fresh_bob = Peer::connect(&env.server.url(), "bob 的电脑", bob_creds.clone(), None, None).await.unwrap();
     // Alice now signs the creation when approving. Tampering with her account
     // rejects the conversation chain before any message can be exposed.
-    assert!(matches!(fresh_bob.client.history(&dm, None, 10).await.unwrap_err(), ClientError::Verify(_)));
+    assert!(matches!(fresh_bob.client.notices(&dm).await.unwrap_err(), ClientError::Verify(_)));
     fresh_bob.client.close();
     db.execute("DELETE FROM account_links WHERE uid = ?1 AND seq = ?2", params![alice_ref.uid.as_str(), account_seq + 1]).unwrap();
 
@@ -1033,9 +876,9 @@ async fn forged_members_devices_and_keys_are_rejected() {
     )
     .unwrap();
     let fresh_bob = Peer::connect(&env.server.url(), "bob 的电脑", bob_creds.clone(), None, None).await.unwrap();
-    let page = fresh_bob.client.history(&dm, None, 10).await.unwrap();
-    assert!(texts(&page.items).is_empty(), "假钥匙不能解出任何东西：{page:?}");
-    assert!(page.items.iter().any(|i| matches!(i, HistoryItem::Rejected { reason, .. } if reason.contains("钥匙"))));
+    let original_record = alice.host.db.lock().unwrap()[&dm][&hello].raw.clone();
+    let err = fresh_bob.client.open_record(&dm, &original_record).await.unwrap_err();
+    assert!(matches!(err, ClientError::Verify(_) | ClientError::Core(_)), "假钥匙不能解出任何东西：{err}");
     fresh_bob.client.close();
     db.execute(
         "UPDATE conv_keys SET sealed = ?1 WHERE conv = ?2 AND generation = 1 AND uid = ?3",
@@ -1047,26 +890,24 @@ async fn forged_members_devices_and_keys_are_rejected() {
     send(&bob, &dm, "一切恢复正常").await;
     alice.wait_text("一切恢复正常").await;
 
-    // 上限：发送太快被拒；消息太大、文件太大在本机就拦住。
+    // 上限：转交太快被拒；消息太大在本机就拦住。
     let mut limited = false;
-    for i in 0..8 {
-        if let Err(error) = alice.client.send(&dm, &MsgId::random(), text(&format!("连发 {i}"))).await {
-            assert_eq!(error.code(), Some(ErrorCode::RateLimited), "{error}");
+    for _ in 0..limits::RELAY_PER_SECOND * 2 {
+        let frame = SealedFrame::seal(&alice_ref.uid, &alice_creds.device, &bob_creds.device.public(), b"x").unwrap();
+        if let Err(error) = raw_alice.request(relay(&bob_device, Some(&dm), frame)).await {
+            assert_eq!(error.code, ErrorCode::RateLimited, "{error}");
             limited = true;
+            break;
         }
     }
-    assert!(limited, "一秒内连发 8 条应被限速");
+    assert!(limited, "一秒内转交太多帧应被限速");
     let long = "长".repeat(30 * 1024);
-    assert!(matches!(alice.client.send(&dm, &MsgId::random(), text(&long)).await.unwrap_err(), ClientError::Core(_)));
-    assert!(matches!(
-        alice.client.upload(&dm, std::io::empty(), limits::FILE_PLAIN_MAX + 1, "大.bin", "application/octet-stream").await.unwrap_err(),
-        ClientError::State(_)
-    ));
+    assert!(matches!(alice.send_as(&dm, &MsgId::random(), text(&long)).await.unwrap_err(), ClientError::Core(_)));
 }
 
-// ---------- 契约 §11：服务器的库和文件目录里找不到任何消息、文件、群名的明文 ----------
+// ---------- friend-im v10：服务器的数据目录里没有任何消息、文件和已读，加密后的也没有 ----------
 
-/// 服务器数据目录里全部文件的字节（数据库、WAL、文件目录）。
+/// 服务器数据目录里全部文件的字节（数据库、WAL）。
 fn dump_server_files(server: &Server) -> Vec<Vec<u8>> {
     fn walk(dir: &std::path::Path, out: &mut Vec<Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -1088,7 +929,7 @@ fn contains(files: &[Vec<u8>], needle: &[u8]) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn server_keeps_only_ciphertext() {
+async fn the_server_never_stores_a_message_a_recall_or_a_read_position() {
     let env = Env::start().await;
     let (mut alice, _) = env.account("alice", "alice 的电脑").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
@@ -1099,8 +940,6 @@ async fn server_keeps_only_ciphertext() {
         "群名明文探针-壬癸",
         "群简介明文探针-子丑寅",
         "改过的群名探针-卯辰巳",
-        "文件名明文探针-午未.txt",
-        "文件内容明文探针-申酉戌亥",
         "撤回的消息探针-天地玄黄",
         "回复里的明文探针-宇宙洪荒",
     ];
@@ -1111,43 +950,100 @@ async fn server_keeps_only_ciphertext() {
         .await
         .unwrap();
     send(&bob, &group, probes[1]).await;
-    let content = probes[6].repeat(5000).into_bytes();
-    let file = alice.client.upload(&group, Cursor::new(content.clone()), content.len() as u64, probes[5], "text/plain").await.unwrap();
-    alice.client.send(&group, &MsgId::random(), Content::Post { parts: vec![Part::File { file }], reply_to: None }).await.unwrap();
-    let recalled = send(&alice, &dm, probes[7]).await;
-    alice.client.recall(&dm, &MsgId::random(), &recalled).await.unwrap();
+    let recalled = send(&alice, &dm, probes[5]).await;
+    alice.recall(&dm, &recalled).await.unwrap();
     alice
-        .client
-        .send(&dm, &MsgId::random(), Content::Post { parts: vec![Part::Text { text: probes[8].into() }], reply_to: Some(recalled) })
+        .send_as(&dm, &MsgId::random(), Content::Post { parts: vec![Part::Text { text: probes[6].into() }], reply_to: Some(recalled) })
         .await
         .unwrap();
     bob.client.set_group_profile(&group, &GroupProfile { name: probes[4].into(), ..Default::default() }).await.unwrap();
-    bob.wait_text(probes[8]).await;
+    let last = bob.wait_text(probes[6]).await;
     alice.wait_text(probes[1]).await;
     wait_notice(&mut alice, &group, "改群名", |c| matches!(c, ConvNotice::ProfileChanged)).await;
-    // 收到的人解得开（确实发出去了），服务器那边一个字都找不到。
-    let got = bob
-        .wait("文件消息", |u| match u {
-            Update::Message(m) => match &m.content {
-                Some(Content::Post { parts, .. }) => parts.iter().find_map(|p| match p {
-                    Part::File { file } => Some(file.clone()),
-                    _ => None,
-                }),
-                _ => None,
-            },
-            _ => None,
-        })
-        .await;
-    let mut out = Vec::new();
-    bob.client.download(&got, &mut out).await.unwrap();
-    assert_eq!(out, content);
+    bob.mark_read(&dm, &last).await.unwrap();
 
+    // 收到的人解得开（确实送到了），服务器的数据目录里什么都找不到：明文没有，加密后的信封也没有。
     let files = dump_server_files(&env.server);
-    assert!(files.len() >= 2, "至少有数据库和一个文件");
+    assert!(!files.is_empty(), "至少有数据库");
     for probe in probes {
-        let utf8 = probe.as_bytes();
-        // 汉字探针取中间一段，防止只是恰好被截断的前缀没出现。
-        assert!(!contains(&files, utf8), "服务器上找到了明文：{probe}");
-        assert!(!contains(&files, bytes::encode(utf8).as_bytes()), "服务器上找到了 base64 形式的明文：{probe}");
+        assert!(!contains(&files, probe.as_bytes()), "服务器上找到了明文：{probe}");
+        assert!(!contains(&files, bytes::encode(probe.as_bytes()).as_bytes()), "服务器上找到了 base64 形式的明文：{probe}");
     }
+    for row in alice.host.db.lock().unwrap().values().flat_map(|rows| rows.values()) {
+        assert!(!contains(&files, row.raw.as_bytes()), "服务器上找到了消息原件");
+        let start = row.raw.find("\"ct\":\"").map(|at| at + 6);
+        if let Some(start) = start {
+            let ct = &row.raw[start..start + 60.min(row.raw.len() - start)];
+            assert!(!contains(&files, ct.as_bytes()), "服务器上找到了信封的密文");
+        }
+    }
+    let db = env.server.db();
+    for table in ["messages", "files", "reading_states"] {
+        let exists: i64 = db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", params![table], |r| r.get(0)).unwrap();
+        assert_eq!(exists, 0, "不该有 {table} 这张表");
+    }
+    let kinds: i64 = db.query_row("SELECT COUNT(*) FROM log WHERE kind IN ('message', 'reading')", [], |r| r.get(0)).unwrap();
+    assert_eq!(kinds, 0, "日志里没有消息和已读事件");
+    assert!(!env.server.dir.path().join("files").exists(), "没有文件目录");
+}
+
+// ---------- friend-im v10 第 3 项：不设离线队列，等双方都有设备在线再送达 ----------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_reaches_an_offline_friend_through_any_device_that_has_it() {
+    let env = Env::start().await;
+    let (mut desktop, recovery) = env.account("alice", "台式机").await;
+    let (mut bob, _) = env.account("bob", "bob 的电脑").await;
+    let dm = approved_dm(&bob.client, &desktop.client).await;
+    send(&bob, &dm, "热身").await;
+    desktop.wait_text("热身").await;
+    let mut laptop = env.device("alice", "笔记本").await;
+    laptop.client.join_with_recovery(&recovery.to_words()).await.unwrap();
+    laptop.wait("可用", |u| matches!(u, Update::Activated).then_some(())).await;
+    laptop.wait_text("热身").await;
+
+    // bob 下线；alice 的台式机发一条，服务器不留。
+    let bob_creds = bob.client.credentials().await;
+    let bob_host = bob.host.clone();
+    bob.client.close();
+    send(&desktop, &dm, "bob 不在线时发的").await;
+    laptop.wait_text("bob 不在线时发的").await;
+
+    // 发送的那台也下线，只留另一台：bob 上线后照样收到。
+    desktop.client.close();
+    let mut back = Peer::connect_with(bob_host, &env.server.url(), "bob 的电脑", bob_creds, None, None).await.unwrap();
+    back.wait_text("bob 不在线时发的").await;
+    let _ = &mut laptop;
+}
+
+// ---------- 难点场景：两台同时离线、撤回比原消息先到、长期离线的设备回来 ----------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn devices_that_were_apart_end_up_identical() {
+    let env = Env::start().await;
+    let direct = format!("http://{}", env.server.direct);
+    let mut alice = Peer::connect(&direct, "alice 的电脑", Credentials::generate(), Some(env.cindy.token("alice", "alice")), None).await.unwrap();
+    alice.client.provision().await.unwrap();
+    let (mut bob, _) = env.account("bob", "bob 的电脑").await;
+    let dm = approved_dm(&bob.client, &alice.client).await;
+    let old = send(&bob, &dm, "断之前").await;
+    alice.wait_text("断之前").await;
+
+    env.server.proxy.cut();
+    bob.wait("断开", |u| matches!(u, Update::Disconnected).then_some(())).await;
+    // 两边同时各发各的；alice 回了一条。bob 在断网时撤回自己的一条。
+    send(&alice, &dm, "alice 断网时发的").await;
+    send(&bob, &dm, "bob 断网时发的").await;
+    bob.recall(&dm, &old).await.unwrap();
+    env.server.proxy.restore();
+    bob.wait("重新连上", |u| matches!(u, Update::Connected { status: DeviceStatus::Active }).then_some(())).await;
+    eventually("撤回到了 alice", async || alice.is_recalled(&dm, &old).then_some(())).await;
+    eventually("两边一模一样", async || {
+        let (a, b) = (alice.texts(&dm).await, bob.texts(&dm).await);
+        (a == b && a.len() == 2).then_some(())
+    })
+    .await;
+    // 撤回的不会复活：再对一轮账还是墓碑。
+    bob.settle(Duration::from_millis(300)).await;
+    assert!(bob.is_recalled(&dm, &old) && alice.is_recalled(&dm, &old));
 }

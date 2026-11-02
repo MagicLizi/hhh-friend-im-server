@@ -7,12 +7,10 @@
 
 mod common;
 
-use std::io::Cursor;
-
 use common::*;
 use friend_im_client::core::ids::MsgId;
 use friend_im_client::core::wire::DeviceStatus;
-use friend_im_client::{Credentials, HistoryItem, Update};
+use friend_im_client::{Credentials, Update};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "冒烟：要先起服务器，见文件开头"]
@@ -39,19 +37,13 @@ async fn smoke_against_a_running_server() {
     let mut bob = connect("bob", "bob 的电脑").await;
     bob.client.provision().await.unwrap();
     let dm = approved_dm(&bob.client, &alice.client).await;
-    alice.client.send(&dm, &MsgId::random(), text("容器里的服务器你好")).await.unwrap();
+    alice.send_as(&dm, &MsgId::random(), text("容器里的服务器你好")).await.unwrap();
     bob.wait_text("容器里的服务器你好").await;
-    let data: Vec<u8> = (0..(3 * 1024 * 1024)).map(|i: u32| (i % 241) as u8).collect();
-    let file = bob.client.upload(&dm, Cursor::new(data.clone()), data.len() as u64, "照片.jpg", "image/jpeg").await.unwrap();
-    let mut out = Vec::new();
-    alice.client.download(&file, &mut out).await.unwrap();
-    assert!(out == data);
 
     let mut laptop = Peer::connect(&url, "alice 的笔记本", Credentials::generate(), Some(cindy.token(&format!("alice-{run}"), "alice")), None).await.unwrap();
     laptop.client.join_with_recovery(&recovery.to_groups()).await.unwrap();
     laptop.wait("可用", |u| matches!(u, Update::Activated).then_some(())).await;
-    let page = laptop.client.history(&dm, None, 10).await.unwrap();
-    assert!(page.items.iter().any(|i| matches!(i, HistoryItem::Message(m) if text_of(m).as_deref() == Some("容器里的服务器你好"))));
+    laptop.wait_text("容器里的服务器你好").await;
     alice.wait("新增电脑的提醒", |u| matches!(u, Update::Account { .. }).then_some(())).await;
-    println!("冒烟通过：开通、加好友、收发、3 MiB 文件、恢复密钥加新电脑并补历史");
+    println!("冒烟通过：开通、加好友、转交收发、恢复密钥加新电脑并从旧电脑补历史");
 }

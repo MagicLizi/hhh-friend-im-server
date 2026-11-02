@@ -15,8 +15,8 @@ services:
     init: true
     environment:
       RUST_LOG: ${FRIEND_IM_LOG:-info}
-      FRIEND_IM_SEND_PER_SECOND: ${FRIEND_IM_SEND_PER_SECOND:-5}
-      FRIEND_IM_SEND_PER_MINUTE: ${FRIEND_IM_SEND_PER_MINUTE:-120}
+      FRIEND_IM_RELAY_PER_SECOND: ${FRIEND_IM_RELAY_PER_SECOND:-200}
+      FRIEND_IM_RELAY_PER_MINUTE: ${FRIEND_IM_RELAY_PER_MINUTE:-6000}
     volumes:
       # 数据库（SQLite）和文件目录都在这个 volume 里；备份与恢复见 README。
       - friend_im_data:/data

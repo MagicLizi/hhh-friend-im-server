@@ -4,10 +4,12 @@
 //! 队列满了（电脑太慢）就断开它，让它重连后按序号补拉，慢电脑拖不垮服务器内存。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use friend_im_core::ids::{DeviceId, Uid};
-use friend_im_core::wire::ServerFrame;
+use friend_im_core::limits;
+use friend_im_core::wire::{Push, ServerFrame};
 use tokio::sync::{Notify, mpsc};
 
 use crate::store::{Effects, Target};
@@ -17,6 +19,8 @@ use crate::store::{Effects, Target};
 pub enum Outbound {
     /// 一帧（装箱：队列每格只占一个指针，1000 格的队列不会因为最大的那种帧而变大）。
     Frame(Box<ServerFrame>),
+    /// 转交的一帧和它占的字节数：写出去之后才从这条连接的排队字节里减掉。
+    Relay(Box<ServerFrame>, usize),
     /// 发完前面的就关闭连接。
     Close,
 }
@@ -24,10 +28,10 @@ pub enum Outbound {
 struct Conn {
     id: u64,
     approved: bool,
-    reading: bool,
     friends: bool,
     tx: mpsc::Sender<Outbound>,
     kill: Arc<Notify>,
+    relay_bytes: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -48,6 +52,8 @@ pub struct Registration {
     pub id: u64,
     pub device: DeviceId,
     pub uid: Uid,
+    /// 登记时已批准。
+    pub approved: bool,
 }
 
 impl Conn {
@@ -68,6 +74,7 @@ impl Hub {
         approved: bool,
         tx: mpsc::Sender<Outbound>,
         kill: Arc<Notify>,
+        relay_bytes: Arc<AtomicUsize>,
     ) -> Registration {
         let mut inner = self.inner.lock().expect("登记处锁");
         inner.next_id += 1;
@@ -79,10 +86,10 @@ impl Hub {
             .push(Conn {
                 id,
                 approved,
-                reading: false,
                 friends: false,
                 tx,
                 kill,
+                relay_bytes,
             });
         inner
             .by_uid
@@ -93,18 +100,7 @@ impl Hub {
             id,
             device: device.clone(),
             uid: uid.clone(),
-        }
-    }
-
-    /// 当前连接明确使用扩展后才订阅，旧客户端不会收到它不认识的帧。
-    pub fn enable_reading(&self, registration: &Registration) {
-        let mut inner = self.inner.lock().expect("登记处锁");
-        if let Some(conn) = inner
-            .by_device
-            .get_mut(&registration.device)
-            .and_then(|conns| conns.iter_mut().find(|c| c.id == registration.id))
-        {
-            conn.reading = true;
+            approved,
         }
     }
 
@@ -119,8 +115,8 @@ impl Hub {
         }
     }
 
-    /// 注销。
-    pub fn unregister(&self, registration: &Registration) {
+    /// 注销。返回这台设备是不是因此离线了（它的最后一条连接）。
+    pub fn unregister(&self, registration: &Registration) -> bool {
         let mut inner = self.inner.lock().expect("登记处锁");
         let empty = match inner.by_device.get_mut(&registration.device) {
             Some(conns) => {
@@ -138,6 +134,40 @@ impl Hub {
                 }
             }
         }
+        empty
+    }
+
+    /// 某账号现在在线、已批准的设备。
+    pub fn online_devices(&self, uid: &Uid) -> Vec<DeviceId> {
+        let inner = self.inner.lock().expect("登记处锁");
+        let Some(devices) = inner.by_uid.get(uid) else {
+            return Vec::new();
+        };
+        devices
+            .iter()
+            .filter(|device| inner.by_device.get(*device).is_some_and(|conns| conns.iter().any(|c| c.approved)))
+            .cloned()
+            .collect()
+    }
+
+    /// 转交一帧给一台设备：放进它已批准连接的队列（重连的片刻可能有两条，接收方按编号去重）。不在线、队列满、排队字节到顶都回 `false`，不等、不留。
+    pub fn relay(&self, to: &DeviceId, push: Push, size: usize) -> bool {
+        let inner = self.inner.lock().expect("登记处锁");
+        let mut delivered = false;
+        for conn in inner.by_device.get(to).into_iter().flatten().filter(|c| c.approved) {
+            if conn.relay_bytes.load(Ordering::Relaxed) + size > limits::RELAY_QUEUE_BYTES {
+                tracing::debug!(conn = conn.id, "这条连接排队的转交帧太多，这一帧不转");
+                continue;
+            }
+            conn.relay_bytes.fetch_add(size, Ordering::Relaxed);
+            let frame = Box::new(ServerFrame::Push { push: push.clone() });
+            if conn.tx.try_send(Outbound::Relay(frame, size)).is_ok() {
+                delivered = true;
+            } else {
+                conn.relay_bytes.fetch_sub(size, Ordering::Relaxed);
+            }
+        }
+        delivered
     }
 
     /// 这台电脑现在是否在线。
@@ -185,18 +215,13 @@ impl Hub {
         }
         for (target, push) in &effects.pushes {
             match target {
-                Target::Account(uid)
-                | Target::AccountExcept(uid, _)
-                | Target::ReadingAccount(uid)
-                | Target::FriendAccount(uid) => {
+                Target::Account(uid) | Target::AccountExcept(uid, _) | Target::FriendAccount(uid) => {
                     let Some(devices) = inner.by_uid.get(uid) else {
                         continue;
                     };
                     let skipped = match target {
                         Target::AccountExcept(_, devices) => Some(devices),
-                        Target::Account(_)
-                        | Target::ReadingAccount(_)
-                        | Target::FriendAccount(_) => None,
+                        Target::Account(_) | Target::FriendAccount(_) => None,
                         Target::Device(_) => unreachable!(),
                     };
                     for device in devices {
@@ -209,9 +234,7 @@ impl Hub {
                             .into_iter()
                             .flatten()
                             .filter(|c| {
-                                c.approved
-                                    && (!matches!(target, Target::ReadingAccount(_)) || c.reading)
-                                    && (!matches!(target, Target::FriendAccount(_)) || c.friends)
+                                c.approved && (!matches!(target, Target::FriendAccount(_)) || c.friends)
                             })
                         {
                             conn.send(Outbound::Frame(Box::new(ServerFrame::Push {
@@ -256,8 +279,7 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use friend_im_core::wire::Push;
-
+    
     #[tokio::test]
     async fn pushes_reach_only_approved_devices_and_full_queue_kills() {
         let hub = Hub::default();
@@ -266,8 +288,8 @@ mod tests {
         let (tx_a, mut rx_a) = mpsc::channel(4);
         let (tx_b, mut rx_b) = mpsc::channel(1);
         let kill_b = Arc::new(Notify::new());
-        let reg_a = hub.register(&uid, &a, true, tx_a, Arc::new(Notify::new()));
-        let _reg_b = hub.register(&uid, &b, false, tx_b, kill_b.clone());
+        let reg_a = hub.register(&uid, &a, true, tx_a, Arc::new(Notify::new()), Arc::default());
+        let _reg_b = hub.register(&uid, &b, false, tx_b, kill_b.clone(), Arc::default());
         hub.push_to_account(&uid, Push::DeviceRemoved);
         assert!(matches!(rx_a.try_recv(), Ok(Outbound::Frame(_))));
         assert!(rx_b.try_recv().is_err(), "没批准的电脑收不到账号推送");
@@ -295,8 +317,8 @@ mod tests {
         let (a, b) = (DeviceId::random(), DeviceId::random());
         let (tx_a, mut rx_a) = mpsc::channel(2);
         let (tx_b, mut rx_b) = mpsc::channel(2);
-        let _reg_a = hub.register(&uid, &a, true, tx_a, Arc::new(Notify::new()));
-        let _reg_b = hub.register(&uid, &b, true, tx_b, Arc::new(Notify::new()));
+        let _reg_a = hub.register(&uid, &a, true, tx_a, Arc::new(Notify::new()), Arc::default());
+        let _reg_b = hub.register(&uid, &b, true, tx_b, Arc::new(Notify::new()), Arc::default());
         hub.apply(
             &Effects {
                 pushes: vec![(Target::AccountExcept(uid, vec![b]), Push::DeviceRemoved)],
@@ -309,38 +331,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reading_pushes_require_approval_and_per_connection_opt_in() {
+    async fn a_relay_reaches_approved_connections_and_is_never_queued_for_later() {
         let hub = Hub::default();
         let uid = Uid::random();
         let device = DeviceId::random();
+        let push = || Push::DeviceRemoved;
+        assert!(!hub.relay(&device, push(), 10), "不在线就回不在线");
+
         let (tx_old, mut old) = mpsc::channel(2);
         let (tx_new, mut new) = mpsc::channel(2);
         let (tx_pending, mut pending) = mpsc::channel(2);
-        let _old = hub.register(&uid, &device, true, tx_old, Arc::new(Notify::new()));
-        let current = hub.register(&uid, &device, true, tx_new, Arc::new(Notify::new()));
-        let unapproved = hub.register(
-            &uid,
-            &DeviceId::random(),
-            false,
-            tx_pending,
-            Arc::new(Notify::new()),
-        );
-        hub.enable_reading(&current);
-        hub.enable_reading(&unapproved);
-        hub.apply(
-            &Effects {
-                pushes: vec![(
-                    Target::ReadingAccount(uid),
-                    Push::ReadingChanged {
-                        conv: friend_im_core::ids::ConvId::random(),
-                    },
-                )],
-                ..Default::default()
-            },
-            None,
-        );
-        assert!(matches!(new.try_recv(), Ok(Outbound::Frame(_))));
-        assert!(old.try_recv().is_err(), "同一设备的旧连接也不能收到新帧");
-        assert!(pending.try_recv().is_err(), "订阅不绕过批准");
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let _old = hub.register(&uid, &device, false, tx_old, Arc::new(Notify::new()), Arc::default());
+        let current = hub.register(&uid, &device, true, tx_new, Arc::new(Notify::new()), bytes.clone());
+        let waiting = DeviceId::random();
+        let _unapproved = hub.register(&uid, &waiting, false, tx_pending, Arc::new(Notify::new()), Arc::default());
+
+        assert!(hub.relay(&device, push(), 10));
+        assert!(matches!(new.try_recv(), Ok(Outbound::Relay(_, 10))));
+        assert!(old.try_recv().is_err(), "没批准的连接收不到");
+        assert!(!hub.relay(&waiting, push(), 10), "没批准的设备收不到");
+        assert!(pending.try_recv().is_err());
+        assert_eq!(hub.online_devices(&uid), vec![device.clone()], "没批准的不算在线");
+
+        // 排队字节到顶：不转，也不断开它。
+        bytes.store(limits::RELAY_QUEUE_BYTES, Ordering::Relaxed);
+        assert!(!hub.relay(&device, push(), 10));
+        bytes.store(0, Ordering::Relaxed);
+        hub.unregister(&current);
+        assert!(hub.is_online(&device), "还有一条连接");
     }
 }

@@ -328,13 +328,14 @@ async fn pushes_are_retried_and_resume_from_the_sync_state() {
     alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text("宿主没收下的")).await.unwrap();
     b.wait("试过推送", |seen| events(seen).iter().any(|e| matches!(e, Event::Messages { messages, .. } if messages.iter().any(|m| text_of(m) == "宿主没收下的"))).then_some(())).await;
     assert!(!b.stored(dm.as_str()).iter().any(|m| text_of(m) == "宿主没收下的"));
-    b.accept_pushes.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // 插件关掉期间来了三条；重启后对账补齐，之前收过的不再推。
+    // 旧宿主到插件退出都不收：插件退出前还会重推，收了这条就在重启前进了库。
     let state = b.last_sync_state();
     let library = b.library.clone();
     b.close().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!b.stored(dm.as_str()).iter().any(|m| text_of(m) == "宿主没收下的"), "重启前宿主库里还没有");
     for i in 0..3 {
         alice.send_as(&dm, &friend_im_client::core::ids::MsgId::random(), text(&format!("关着时的第{i}条"))).await.unwrap();
     }

@@ -19,14 +19,14 @@ pub struct Issuer {
 pub struct Config {
     /// 监听地址（容器里 `0.0.0.0:8080`，宿主机只把它绑到 127.0.0.1，前面一层反向代理挂证书）。
     pub listen: SocketAddr,
-    /// 数据目录：SQLite 文件与文件目录都在这里。
+    /// 数据目录：SQLite 文件在这里。
     pub data_dir: PathBuf,
     /// 认可的 Cindy 签发方。
     pub issuers: Vec<Issuer>,
-    /// 每个账号每秒最多发几条（默认见 `friend_im_core::limits`）。
-    pub send_per_second: u32,
-    /// 每个账号每分钟最多发几条。
-    pub send_per_minute: u32,
+    /// 每个账号每秒最多转交几帧（默认见 `friend_im_core::limits`）。
+    pub relay_per_second: u32,
+    /// 每个账号每分钟最多转交几帧。
+    pub relay_per_minute: u32,
 }
 
 /// Cindy 的两个签发方（与 HHH `hhh-friend/src/auth/types.rs` 一致）。
@@ -72,8 +72,8 @@ impl Config {
             listen,
             data_dir,
             issuers,
-            send_per_second: env_u32("FRIEND_IM_SEND_PER_SECOND", limits::SEND_PER_SECOND)?,
-            send_per_minute: env_u32("FRIEND_IM_SEND_PER_MINUTE", limits::SEND_PER_MINUTE)?,
+            relay_per_second: env_u32("FRIEND_IM_RELAY_PER_SECOND", limits::RELAY_PER_SECOND)?,
+            relay_per_minute: env_u32("FRIEND_IM_RELAY_PER_MINUTE", limits::RELAY_PER_MINUTE)?,
         })
     }
 
@@ -83,8 +83,8 @@ impl Config {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             data_dir,
             issuers,
-            send_per_second: limits::SEND_PER_SECOND,
-            send_per_minute: limits::SEND_PER_MINUTE,
+            relay_per_second: limits::RELAY_PER_SECOND,
+            relay_per_minute: limits::RELAY_PER_MINUTE,
         }
     }
 }

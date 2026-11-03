@@ -96,8 +96,7 @@ async fn approval_is_required_idempotent_private_and_survives_restart() {
     );
     assert_eq!(alice.client.convs().await.unwrap().len(), 1);
     alice
-        .client
-        .send(&dm, &MsgId::random(), text("批准后的加密消息"))
+        .send_as(&dm, &MsgId::random(), text("批准后的加密消息"))
         .await
         .unwrap();
     bob.wait_text("批准后的加密消息").await;
@@ -434,12 +433,11 @@ async fn old_friend_data_migrates_and_invalid_sources_cannot_be_approved() {
     let (mut bob, _) = env.account("migration-b", "B").await;
     let old = approved_dm(&alice.client, &bob.client).await;
     alice
-        .client
-        .send(&old, &MsgId::random(), text("old encrypted history"))
+        .send_as(&old, &MsgId::random(), text("old encrypted history"))
         .await
         .unwrap();
     bob.wait_text("old encrypted history").await;
-    // Recreate the pre-approval schema while retaining real account, key and message data.
+    // Recreate the pre-approval schema while retaining real account and key data.
     env.server
         .db()
         .execute_batch(
@@ -464,21 +462,14 @@ async fn old_friend_data_migrates_and_invalid_sources_cannot_be_approved() {
         .await;
     assert_eq!(approved_dm(&alice.client, &bob.client).await, old);
     alice
-        .client
-        .send(&old, &MsgId::random(), text("old friend after migration"))
+        .send_as(&old, &MsgId::random(), text("old friend after migration"))
         .await
         .unwrap();
     bob.wait_text("old friend after migration").await;
-    assert!(
-        env.server
-            .db()
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE conv=?1",
-                [old.as_str()],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap()
-            >= 2
+    assert_eq!(
+        bob.texts(&old).await,
+        ["old encrypted history", "old friend after migration"],
+        "聊天记录在设备上，升级服务器不影响"
     );
     let (carol, _) = env.account("migration-c", "C").await;
     approved_dm(&carol.client, &alice.client).await;

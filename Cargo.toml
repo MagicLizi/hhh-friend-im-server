@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 publish = false
 license = "MIT"
-description = "Friend-IM 服务器：账号、电脑、好友、群、密文消息与文件的存储和转发。只存密文，解不开。"
+description = "Friend-IM 服务器：保存账号、电脑、好友、群成员和加密钥匙；消息与文件只在内存里转交给在线设备，不落盘。"
 
 [dependencies]
 # 两边共用的格式与校验：按同级目录引用插件仓库。版本靠取插件仓库的同名标签固定：

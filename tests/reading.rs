@@ -1,352 +1,106 @@
-//! 用真实客户端、WebSocket、签名与 SQLite 验证阅读，不依赖线上账号。
+//! 已读记录（friend-im v10 第 5 项）：跟着设备对账走，服务器不存；每台设备取最新的一份，所有设备算出来一样。
 mod common;
 
-use common::*;
-use friend_im_client::core::{
-    conv::GroupProfile,
-    ids::MsgId,
-    reading::ReadingEnvelope,
-    wire::{DeviceStatus, ErrorCode, Request, Response},
-};
-use friend_im_client::{ReadingMark, Update};
-use rusqlite::params;
+use std::time::{Duration, Instant};
 
-async fn send(peer: &Peer, conv: &friend_im_client::core::ids::ConvId, body: &str) -> MsgId {
+use common::*;
+use friend_im_client::core::conv::GroupProfile;
+use friend_im_client::core::ids::{ConvId, MsgId};
+use friend_im_client::core::sync::Key;
+use friend_im_client::Update;
+
+async fn send(peer: &Peer, conv: &ConvId, body: &str) -> MsgId {
     let id = MsgId::random();
-    peer.client.send(conv, &id, text(body)).await.unwrap();
+    peer.send_as(conv, &id, text(body)).await.unwrap();
     id
 }
 
-fn writes(env: &Env) -> (i64, i64) {
-    let db = env.server.db();
-    (
-        db.query_row("SELECT count(*) FROM log WHERE kind='reading'", [], |r| {
-            r.get(0)
-        })
-        .unwrap(),
-        db.query_row("SELECT count(*) FROM reading_states", [], |r| r.get(0))
-            .unwrap(),
-    )
+async fn through(peer: &Peer, conv: &ConvId) -> Option<Key> {
+    peer.client.reading_through(conv).await.unwrap()
+}
+
+async fn wait_through(peer: &Peer, conv: &ConvId, want: &Key) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if through(peer, conv).await.as_ref() == Some(want) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{} 等不到已读位置", peer.name);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn exact_boundaries_unknown_readers_and_historical_membership() {
+async fn read_positions_travel_between_devices_and_stay_the_same_everywhere() {
     let env = Env::start().await;
-    let (alice, _) = env.account("alice", "pc").await;
-    let (mut bob, _) = env.account("bob", "pc").await;
-    let (mut carol, _) = env.account("carol", "pc").await;
-    approved_dm(&alice.client, &bob.client).await;
-    approved_dm(&alice.client, &carol.client).await;
+    let (mut desktop, recovery) = env.account("alice", "台式机").await;
+    let (bob, _) = env.account("bob", "bob 的电脑").await;
+    let dm = approved_dm(&bob.client, &desktop.client).await;
+    send(&bob, &dm, "第一条").await;
+    send(&bob, &dm, "第二条").await;
+    let first = desktop.wait_text("第一条").await;
+    let second = desktop.wait_text("第二条").await;
+    let mut laptop = env.device("alice", "笔记本").await;
+    laptop.client.join_with_recovery(&recovery.to_words()).await.unwrap();
+    laptop.wait("可用", |u| matches!(u, Update::Activated).then_some(())).await;
+    laptop.wait_text("第二条").await;
+
+    // 台式机读到第二条：笔记本跟着知道，且只认最后读到的位置。
+    desktop.mark_read(&dm, &second).await.unwrap();
+    let key = Key { at: second.ctime_ms, id: second.id.clone() };
+    wait_through(&laptop, &dm, &key).await;
+
+    // 乱序上报：笔记本后来才报读到第一条，不会让位置往回退。
+    laptop.mark_read(&dm, &first).await.unwrap();
+    assert_eq!(through(&laptop, &dm).await, Some(key.clone()));
+    assert_eq!(through(&desktop, &dm).await, Some(key.clone()));
+
+    // 笔记本重启：内存里的记录没了，从在线的台式机补回来。
+    let creds = laptop.client.credentials().await;
+    let host = laptop.host.clone();
+    laptop.client.close();
+    let reopened = Peer::connect_with(host, &env.server.url(), "笔记本", creds, None, None).await.unwrap();
+    wait_through(&reopened, &dm, &key).await;
+
+    // 服务器上什么都没有。
+    let tables: i64 = env.server.db().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'reading_states'", [], |r| r.get(0)).unwrap();
+    assert_eq!(tables, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receipts_only_count_who_was_there_when_the_message_was_sent() {
+    let env = Env::start().await;
+    let (mut alice, _) = env.account("alice", "alice 的电脑").await;
+    let (mut bob, _) = env.account("bob", "bob 的电脑").await;
+    let (mut carol, _) = env.account("carol", "carol 的电脑").await;
+    let (dave, _) = env.account("dave", "dave 的电脑").await;
+    approved_dm(&bob.client, &alice.client).await;
+    approved_dm(&carol.client, &alice.client).await;
+    approved_dm(&dave.client, &alice.client).await;
     let group = alice
         .client
-        .create_group(
-            &GroupProfile::default(),
-            &[bob.client.uid().clone(), carol.client.uid().clone()],
-        )
+        .create_group(&GroupProfile { name: "回执".into(), ..Default::default() }, &[bob.client.uid().clone(), carol.client.uid().clone()])
         .await
         .unwrap();
-    let first = send(&alice, &group, "边界前").await;
-    let second = send(&alice, &group, "边界后").await;
-    let first_message = bob.wait_text("边界前").await;
-    let second_message = bob.wait_text("边界后").await;
-    carol.wait_text("边界后").await;
-    assert!(first_message.log < second_message.log);
-    assert!(alice.client.supports_reading().await);
-    let receipts = alice
-        .client
-        .reading_receipts(&group, &[first.clone(), second.clone()])
-        .await
-        .unwrap();
-    assert!(
-        receipts
-            .iter()
-            .all(|r| !r.complete && r.readers.is_empty() && r.unreaders.is_empty())
-    );
-    assert_eq!(writes(&env), (0, 0), "只读查询绝不写回已读");
-    assert!(
-        bob.client
-            .mark_read(&group, &first, Some(second_message.log))
-            .await
-            .is_err()
-    );
-    assert_eq!(writes(&env), (0, 0), "错误边界不落库");
-    assert_eq!(
-        bob.client
-            .mark_read(&group, &first, Some(first_message.log))
-            .await
-            .unwrap(),
-        ReadingMark::Applied
-    );
-    let receipts = alice
-        .client
-        .reading_receipts(&group, &[first.clone(), second.clone()])
-        .await
-        .unwrap();
-    assert_eq!(receipts[0].readers, [bob.client.uid().clone()]);
-    assert_eq!(receipts[1].unreaders, [bob.client.uid().clone()]);
-    assert!(!receipts[1].complete, "没写过阅读的旧客户端保持未知");
-    assert_eq!(
-        carol.client.mark_read(&group, &second, None).await.unwrap(),
-        ReadingMark::Applied
-    );
-    carol.client.leave(&group).await.unwrap();
-    let receipts = alice
-        .client
-        .reading_receipts(&group, std::slice::from_ref(&second))
-        .await
-        .unwrap();
-    assert!(receipts[0].complete);
-    assert_eq!(receipts[0].readers, [carol.client.uid().clone()]);
-    assert_eq!(
-        receipts[0].unreaders,
-        [bob.client.uid().clone()],
-        "退出成员仍属于当时的收件人"
-    );
-    let before = writes(&env);
-    assert_eq!(
-        bob.client.mark_read(&group, &first, None).await.unwrap(),
-        ReadingMark::Applied
-    );
-    assert_eq!(writes(&env), before, "重复或更旧的边界不写、不重推");
-    assert!(
-        bob.client
-            .reading_receipts(&group, &[second])
-            .await
-            .unwrap()
-            .is_empty(),
-        "不泄漏别人发的消息回执"
-    );
-}
+    send(&alice, &group, "dave 进群之前").await;
+    let message = alice.wait_text("dave 进群之前").await;
+    let seen_by_bob = bob.wait_text("dave 进群之前").await;
+    carol.wait_text("dave 进群之前").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    alice.client.invite(&group, &[dave.client.uid().clone()]).await.unwrap();
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cross_device_restart_and_cas_preserve_the_latest_boundary() {
-    let mut env = Env::start().await;
-    let (alice, _) = env.account("alice", "pc").await;
-    let (mut bob, _) = env.account("bob", "pc").await;
-    let conv = approved_dm(&alice.client, &bob.client).await;
-    let one = send(&alice, &conv, "第一条").await;
-    let two = send(&alice, &conv, "第二条").await;
-    let third = send(&alice, &conv, "第三条").await;
-    let first = bob.wait_text("第一条").await;
-    let second = bob.wait_text("第二条").await;
-    bob.wait_text("第三条").await;
-    let mut laptop = env.device("bob", "laptop").await;
-    laptop
-        .wait("待批准", |u| {
-            matches!(
-                u,
-                Update::Connected {
-                    status: DeviceStatus::Pending
-                }
-            )
-            .then_some(())
-        })
-        .await;
-    let join = laptop.client.join_start().await.unwrap();
-    let request = bob
-        .wait("批准申请", |u| {
-            if let Update::JoinRequested(info) = u {
-                Some(info.clone())
-            } else {
-                None
-            }
-        })
-        .await;
-    bob.client
-        .join_respond(&request.request, join.code.as_str())
-        .await
-        .unwrap();
-    laptop
-        .wait("电脑可用", |u| {
-            matches!(u, Update::Activated).then_some(())
-        })
-        .await;
-    assert_eq!(
-        bob.client
-            .mark_read(&conv, &one, Some(first.log))
-            .await
-            .unwrap(),
-        ReadingMark::Applied
-    );
-    let old_json: String = env
-        .server
-        .db()
-        .query_row(
-            "SELECT envelope FROM reading_states WHERE reader=?1",
-            [bob.client.uid().as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let old: ReadingEnvelope = serde_json::from_str(&old_json).unwrap();
-    let creds = bob.client.credentials().await;
-    let (mut raw, _) = Raw::connect(&env.server.url(), &creds, "协议核对").await;
-    let before = writes(&env);
-    raw.request(Request::ReadingSet {
-        envelope: old.clone(),
-    })
-    .await
-    .unwrap();
-    assert_eq!(writes(&env), before, "完全相同的重放幂等");
-    assert_eq!(
-        bob.client
-            .mark_read(&conv, &two, Some(second.log))
-            .await
-            .unwrap(),
-        ReadingMark::Applied
-    );
-    assert_eq!(
-        raw.request(Request::ReadingSet {
-            envelope: old.clone()
-        })
-        .await
-        .unwrap_err()
-        .code,
-        ErrorCode::Conflict
-    );
-    let mut tampered = old;
-    tampered.ct.0[0] ^= 1;
-    assert_eq!(
-        raw.request(Request::ReadingSet { envelope: tampered })
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::Invalid
-    );
-    assert_eq!(
-        laptop.client.reading_through(&conv).await.unwrap(),
-        Some(second.log)
-    );
-    let before = writes(&env);
-    assert_eq!(
-        laptop.client.mark_read(&conv, &one, None).await.unwrap(),
-        ReadingMark::Applied
-    );
-    assert_eq!(writes(&env), before, "另一设备不能把已读倒退");
-    let json: String = env
-        .server
-        .db()
-        .query_row(
-            "SELECT envelope FROM reading_states WHERE reader=?1",
-            [bob.client.uid().as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(
-        !json.contains(one.as_str()) && !json.contains(two.as_str()) && !json.contains("through"),
-        "服务端不保存阅读消息或水位明文"
-    );
-    env.server.restart().await;
-    bob.wait("断线", |u| {
-        matches!(u, Update::Disconnected).then_some(())
-    })
-    .await;
-    bob.wait("重连", |u| {
-        matches!(
-            u,
-            Update::Connected {
-                status: DeviceStatus::Active
-            }
-        )
-        .then_some(())
-    })
-    .await;
-    assert_eq!(
-        bob.client.reading_through(&conv).await.unwrap(),
-        Some(second.log)
-    );
-    let receipt = alice
-        .client
-        .reading_receipts(&conv, &[third])
-        .await
-        .unwrap();
-    assert_eq!(
-        receipt[0].unreaders,
-        [bob.client.uid().clone()],
-        "重启不会读掉边界之后的消息"
-    );
-    // 数据被服务端改坏时，客户端不生成任何伪回执。
-    let mut corrupt: ReadingEnvelope = serde_json::from_str(&json).unwrap();
-    corrupt.ct.0[0] ^= 1;
-    env.server
-        .db()
-        .execute(
-            "UPDATE reading_states SET envelope=?1 WHERE reader=?2",
-            params![
-                serde_json::to_string(&corrupt).unwrap(),
-                bob.client.uid().as_str()
-            ],
-        )
-        .unwrap();
-    assert!(alice.client.reading_receipts(&conv, &[one]).await.is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reading_rejects_foreign_conversations_and_pending_devices() {
-    let env = Env::start().await;
-    let (alice, _) = env.account("alice", "pc").await;
-    let (mut bob, _) = env.account("bob", "pc").await;
-    let (eve, _) = env.account("eve", "pc").await;
-    let conv = approved_dm(&alice.client, &bob.client).await;
-    let id = send(&alice, &conv, "不能跨会话").await;
-    bob.wait_text("不能跨会话").await;
-    assert_eq!(
-        code(&eve.client.reading_through(&conv).await.unwrap_err()),
-        Some(ErrorCode::Forbidden)
-    );
-    let pending = env.device("bob", "pending").await;
-    let (mut raw, _) = Raw::connect(
-        &env.server.url(),
-        &pending.client.credentials().await,
-        "pending",
-    )
-    .await;
-    assert_eq!(
-        raw.request(Request::ReadingGet {
-            conv: conv.clone(),
-            after: 0,
-            limit: 20
-        })
-        .await
-        .unwrap_err()
-        .code,
-        ErrorCode::NotApproved
-    );
-    let other = approved_dm(&alice.client, &eve.client).await;
-    assert!(alice.client.mark_read(&other, &id, None).await.is_err());
-    assert!(
-        alice
-            .client
-            .reading_messages(&other, &[id])
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(writes(&env), (0, 0));
-    let (mut raw, _) = Raw::connect(
-        &env.server.url(),
-        &alice.client.credentials().await,
-        "核对分页",
-    )
-    .await;
-    assert!(matches!(
-        raw.request(Request::ReadingGet {
-            conv: conv.clone(),
-            after: 0,
-            limit: 200
-        })
-        .await
-        .unwrap(),
-        Response::ReadingPage { more: false, .. }
-    ));
-    assert_eq!(
-        raw.request(Request::ReadingGet {
-            conv,
-            after: u64::MAX,
-            limit: 200
-        })
-        .await
-        .unwrap_err()
-        .code,
-        ErrorCode::BadRequest
-    );
+    // 还没有 carol 的记录：名单不完整，不把她算成未读。
+    bob.mark_read(&group, &seen_by_bob).await.unwrap();
+    let uid = bob.client.uid().clone();
+    let deadline = Instant::now() + WAIT;
+    let receipt = loop {
+        let receipts = alice.client.reading_receipts(&group, std::slice::from_ref(&message)).await.unwrap();
+        if receipts[0].readers.contains(&uid) {
+            break receipts.into_iter().next().unwrap();
+        }
+        assert!(Instant::now() < deadline, "等不到 bob 的已读");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
+    assert!(!receipt.complete, "carol 的情况未知");
+    assert!(!receipt.readers.contains(dave.client.uid()) && !receipt.unreaders.contains(dave.client.uid()), "dave 发消息时不在群里");
 }

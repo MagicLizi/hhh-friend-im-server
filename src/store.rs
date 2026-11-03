@@ -20,7 +20,7 @@ use friend_im_core::wire::{DeviceKind, ErrorCode, Push, WireError};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// 库结构版本：改表结构时加 1 并写迁移。
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 /// 签名链现状缓存的条数上限：超过就整体清空重新按需加载（1000 个账号的规模下很少触发）。
 const CACHE_MAX: usize = 20_000;
 
@@ -132,40 +132,6 @@ CREATE TABLE IF NOT EXISTS invites(
     seed BLOB NOT NULL,
     expires_ms INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS messages(
-    log INTEGER PRIMARY KEY,
-    conv TEXT NOT NULL,
-    msg TEXT NOT NULL,
-    sender TEXT NOT NULL,
-    ts_ms INTEGER NOT NULL,
-    env TEXT NOT NULL,
-    recalled INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(conv, msg)
-);
-CREATE INDEX IF NOT EXISTS messages_conv ON messages(conv, log);
--- 按时间读历史、会话活动：时间窗口先在这里换成序号范围（v0.2.0 加，老库打开时补建，表结构不变）。
-CREATE INDEX IF NOT EXISTS messages_conv_ts ON messages(conv, ts_ms, log);
--- 附加表不改变旧表或 schema_version：旧服务器可保留这些密文安全降级。
-CREATE TABLE IF NOT EXISTS reading_states(
-    conv TEXT NOT NULL,
-    reader TEXT NOT NULL,
-    device TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    log INTEGER NOT NULL,
-    envelope TEXT NOT NULL,
-    PRIMARY KEY(conv, reader, device)
-);
-CREATE INDEX IF NOT EXISTS reading_states_page ON reading_states(conv, log);
-CREATE TABLE IF NOT EXISTS files(
-    file TEXT PRIMARY KEY,
-    uid TEXT NOT NULL,
-    conv TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    received INTEGER NOT NULL DEFAULT 0,
-    created_ms INTEGER NOT NULL,
-    created_log INTEGER NOT NULL,
-    complete INTEGER NOT NULL DEFAULT 0
-);
 CREATE TABLE IF NOT EXISTS log(
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_ms INTEGER NOT NULL,
@@ -177,6 +143,16 @@ CREATE TABLE IF NOT EXISTS feed(
     seq INTEGER NOT NULL,
     PRIMARY KEY(uid, seq)
 ) WITHOUT ROWID;
+"#;
+
+/// 清掉数据面：旧版的消息、文件、已读，以及日志里对应的消息事件。控制面的表一张不动。
+const DROP_DATA_PLANE: &str = r#"
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS reading_states;
+DROP TABLE IF EXISTS files;
+DELETE FROM feed WHERE seq IN (SELECT seq FROM log WHERE kind = 'message');
+DELETE FROM log WHERE kind = 'message';
+UPDATE accounts SET storage_bytes = 0;
 "#;
 
 /// 一次操作要发出的推送：事务提交后、仍持有存储锁时按顺序发出，保证每台电脑收到的推送和日志顺序一致。
@@ -195,8 +171,6 @@ pub struct Effects {
 pub enum Target {
     /// 仅已协商好友申请扩展的连接。
     FriendAccount(Uid),
-    /// 仅某账号已协商阅读扩展的连接。
-    ReadingAccount(Uid),
     /// 某账号所有已批准的电脑。
     Account(Uid),
     /// 某账号所有已批准的电脑，跳过已经由局域网提交的电脑。
@@ -304,7 +278,6 @@ pub struct Store {
     pub(crate) conn: Connection,
     pub(crate) accounts: HashMap<Uid, AccountCache>,
     pub(crate) convs: HashMap<ConvId, ConvState>,
-    pub(crate) files_dir: PathBuf,
     /// 最近一个已提交的日志序号。
     pub(crate) last_log: u64,
 }
@@ -313,18 +286,18 @@ impl Store {
     /// 打开（或新建）数据目录里的库。
     pub fn open(data_dir: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir).map_err(|e| format!("建不了数据目录：{e}"))?;
-        let files_dir = data_dir.join("files");
-        std::fs::create_dir_all(&files_dir).map_err(|e| format!("建不了文件目录：{e}"))?;
         let conn = Connection::open(data_dir.join("friend-im.sqlite3"))
             .map_err(|e| format!("打不开数据库：{e}"))?;
-        Self::init(conn, files_dir)
+        Self::init(conn, Some(data_dir.join("files")))
     }
 
-    fn init(conn: Connection, files_dir: PathBuf) -> Result<Self, String> {
+    /// `files_dir` 是旧版存文件的目录：升级时删掉。
+    fn init(conn: Connection, files_dir: Option<PathBuf>) -> Result<Self, String> {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
         // Check the version before schema writes, and migrate atomically. Version 3
         // intentionally refuses old servers: they do not enforce friend approval.
+        // Version 4 refuses them too: they would start storing messages again.
         let has_meta: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta')",
@@ -341,7 +314,7 @@ impl Store {
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
-            if !matches!(current.as_deref(), Some("1" | "2" | "3")) {
+            if !matches!(current.as_deref(), Some("1" | "2" | "3" | "4")) {
                 return Err(format!("数据库结构版本不认识：{current:?}"));
             }
         }
@@ -362,6 +335,7 @@ impl Store {
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        let upgrading = matches!(version.as_deref(), Some("1" | "2" | "3"));
         match version.as_deref().map(str::parse::<i64>) {
             None => {
                 tx.execute(
@@ -378,17 +352,32 @@ impl Store {
                 )
                 .map_err(|e| e.to_string())?;
             }
-            Some(Ok(2)) => {}
+            Some(Ok(2 | 3)) => {}
             Some(other) => return Err(format!("数据库结构版本不认识：{other:?}")),
         }
         tx.execute_batch(crate::ops_friends::SCHEMA)
             .map_err(|e| format!("好友申请迁移失败：{e}"))?;
-        tx.execute(
+        // 旧版存的消息、文件和已读：这一版开始服务器不存，升级时直接清掉（不搬，契约 friend-im v10 第 7 项）。
+        if upgrading {
+            tx.execute_batch(DROP_DATA_PLANE)
+                .map_err(|e| format!("清旧消息失败：{e}"))?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        // 库提交之后再删文件目录，删完才写新版本号：中断了，下次打开版本还是旧的，接着删。
+        if upgrading
+            && let Some(dir) = files_dir
+        {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("删旧文件目录失败：{error}")),
+            }
+        }
+        conn.execute(
             "UPDATE meta SET value=?1 WHERE key='schema_version'",
             params![SCHEMA_VERSION.to_string()],
         )
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
         let last_log: i64 = conn
             .query_row("SELECT COALESCE(MAX(seq), 0) FROM log", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
@@ -396,7 +385,6 @@ impl Store {
             conn,
             accounts: HashMap::new(),
             convs: HashMap::new(),
-            files_dir,
             last_log: last_log as u64,
         })
     }
@@ -409,12 +397,6 @@ impl Store {
         backup
             .run_to_completion(256, std::time::Duration::from_millis(5), None)
             .map_err(|e| e.to_string())
-    }
-
-    /// 文件在磁盘上的路径：按编号前两个字符分目录，单个目录不会堆太多文件。
-    pub(crate) fn file_path(&self, file: &str) -> PathBuf {
-        let prefix: String = file.chars().take(2).collect();
-        self.files_dir.join(prefix).join(file)
     }
 
     pub(crate) fn trim_caches(&mut self) {
@@ -725,12 +707,7 @@ impl Directory for CacheDirectory<'_> {
 
 #[cfg(test)]
 pub(crate) fn open_memory() -> Store {
-    let dir = std::env::temp_dir().join(format!(
-        "friend-im-test-{}",
-        friend_im_core::ids::ConvId::random()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    Store::init(Connection::open_in_memory().unwrap(), dir).unwrap()
+    Store::init(Connection::open_in_memory().unwrap(), None).unwrap()
 }
 
 #[cfg(test)]
@@ -765,7 +742,7 @@ mod tests {
                     |r| r.get::<_, String>(0)
                 )
                 .unwrap(),
-            "3"
+            "4"
         );
         assert_eq!(
             restored
@@ -774,6 +751,94 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// 建一个带旧数据的 schema 3 库：控制面的表由当前结构建好，再补上旧版存消息、文件、已读的表。
+    fn old_data_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::open(dir.path()).unwrap());
+        let conn = Connection::open(dir.path().join("friend-im.sqlite3")).unwrap();
+        conn.execute_batch(
+            "UPDATE meta SET value='3' WHERE key='schema_version';
+             CREATE TABLE messages(log INTEGER PRIMARY KEY, conv TEXT NOT NULL, msg TEXT NOT NULL, sender TEXT NOT NULL, ts_ms INTEGER NOT NULL, env TEXT NOT NULL, recalled INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE reading_states(conv TEXT NOT NULL, reader TEXT NOT NULL, device TEXT NOT NULL, revision INTEGER NOT NULL, log INTEGER NOT NULL, envelope TEXT NOT NULL);
+             CREATE TABLE files(file TEXT PRIMARY KEY, uid TEXT NOT NULL, conv TEXT NOT NULL, size INTEGER NOT NULL, received INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, created_log INTEGER NOT NULL, complete INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO accounts(uid, name, created_ms) VALUES('u1', '留下的账号', 1);
+             INSERT INTO log(seq, ts_ms, kind, payload) VALUES(1, 1, 'conv_link', '{}'), (2, 2, 'message', NULL);
+             INSERT INTO feed(uid, seq) VALUES('u1', 1), ('u1', 2);
+             INSERT INTO messages(log, conv, msg, sender, ts_ms, env) VALUES(2, 'c', 'm', 'u1', 2, '旧信封');
+             INSERT INTO files(file, uid, conv, size, created_ms, created_log) VALUES('f', 'u1', 'c', 1, 1, 1);
+             INSERT INTO reading_states VALUES('c', 'u1', 'd', 1, 3, '旧已读');",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("files/ab")).unwrap();
+        std::fs::write(dir.path().join("files/ab/f"), b"old").unwrap();
+        dir
+    }
+
+    fn tables(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    fn version(path: &Path) -> String {
+        Connection::open(path).unwrap().query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn upgrading_clears_old_messages_and_files_and_keeps_the_control_plane() {
+        let dir = old_data_dir();
+        let path = dir.path().join("friend-im.sqlite3");
+        drop(Store::open(dir.path()).unwrap());
+        assert_eq!(version(&path), "4");
+        let names = tables(&path);
+        for gone in ["messages", "files", "reading_states"] {
+            assert!(!names.iter().any(|n| n == gone), "{gone} 应被清掉");
+        }
+        for kept in ["accounts", "devices", "convs", "conv_links", "conv_keys", "friend_requests"] {
+            assert!(names.iter().any(|n| n == kept), "{kept} 要留着");
+        }
+        assert!(!dir.path().join("files").exists(), "文件目录清掉了");
+        let conn = Connection::open(&path).unwrap();
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM accounts"), 1, "账号一个不少");
+        assert_eq!(count("SELECT COUNT(*) FROM log WHERE kind='message'"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM log"), 1, "控制面的日志留着");
+        assert_eq!(count("SELECT COUNT(*) FROM feed"), 1);
+    }
+
+    #[test]
+    fn an_upgrade_interrupted_before_the_files_are_gone_finishes_on_the_next_open() {
+        let dir = old_data_dir();
+        let path = dir.path().join("friend-im.sqlite3");
+        // 库已经清完、提交了，文件目录删到一半断电：版本还是 3。
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(DROP_DATA_PLANE).unwrap();
+        drop(conn);
+        std::fs::remove_dir_all(dir.path().join("files/ab")).unwrap();
+        std::fs::create_dir_all(dir.path().join("files/cd")).unwrap();
+        std::fs::write(dir.path().join("files/cd/g"), b"old").unwrap();
+        assert_eq!(version(&path), "3");
+
+        drop(Store::open(dir.path()).unwrap());
+        assert_eq!(version(&path), "4");
+        assert!(!dir.path().join("files").exists(), "接着删完");
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_and_reopening_the_new_one_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::open(dir.path()).unwrap());
+        let path = dir.path().join("friend-im.sqlite3");
+        // 新版本号之后不再碰数据目录。
+        std::fs::create_dir_all(dir.path().join("files")).unwrap();
+        drop(Store::open(dir.path()).unwrap());
+        assert!(dir.path().join("files").exists());
+        Connection::open(&path).unwrap().execute_batch("UPDATE meta SET value='5' WHERE key='schema_version'").unwrap();
+        assert!(Store::open(dir.path()).is_err());
+        // 旧程序只认 1–3：版本 4 它打不开（这里按旧程序的判断写死，防止以后悄悄改回去）。
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 
     #[test]
@@ -791,7 +856,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -830,7 +895,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
         let _ = std::fs::remove_dir_all(dir);
     }
 

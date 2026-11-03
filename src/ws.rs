@@ -3,6 +3,7 @@
 //! 一条连接的请求按收到的顺序串行处理；回执和推送走同一个有界队列，由单独的写任务发出。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -12,7 +13,7 @@ use friend_im_core::bytes::Fixed;
 use friend_im_core::crypto;
 use friend_im_core::limits;
 use friend_im_core::wire::{
-    self, ClientFrame, ErrorCode, HelloAuth, Request, Response, ServerFrame, WireError,
+    self, ClientFrame, ErrorCode, HelloAuth, Push, Request, Response, ServerFrame, WireError,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Notify, mpsc};
@@ -20,7 +21,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::cindy::CindyError;
 use crate::hub::{Outbound, Registration};
 use crate::ops_account::{LoginAuth, OpResult, Session, session_hash};
-use crate::store::fail;
+use crate::store::{Effects, Target, fail};
 use crate::{App, Locked, now_ms};
 
 /// 连上后多久内必须发 `hello`。
@@ -48,21 +49,25 @@ async fn serve(app: Arc<App>, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Outbound>(limits::PUSH_QUEUE);
     let kill = Arc::new(Notify::new());
+    let relay_bytes = Arc::new(AtomicUsize::new(0));
+    let queued = relay_bytes.clone();
     let writer = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
-            match out {
-                Outbound::Frame(frame) => {
-                    let Ok(text) = serde_json::to_string(&frame) else {
-                        continue;
-                    };
-                    if sink.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
-                }
+            let (frame, relayed) = match out {
+                Outbound::Frame(frame) => (frame, 0),
+                Outbound::Relay(frame, size) => (frame, size),
                 Outbound::Close => {
                     let _ = sink.send(Message::Close(None)).await;
                     break;
                 }
+            };
+            let Ok(text) = serde_json::to_string(&frame) else {
+                continue;
+            };
+            let sent = sink.send(Message::Text(text.into())).await;
+            queued.fetch_sub(relayed, Ordering::Relaxed);
+            if sent.is_err() {
+                break;
             }
         }
         let _ = sink.close().await;
@@ -78,8 +83,11 @@ async fn serve(app: Arc<App>, socket: WebSocket) {
         return;
     }
     let registration =
-        match tokio::time::timeout(HELLO_TIMEOUT, hello(&app, &mut stream, &tx, &kill, &nonce))
-            .await
+        match tokio::time::timeout(
+            HELLO_TIMEOUT,
+            hello(&app, &mut stream, &tx, &kill, &relay_bytes, &nonce),
+        )
+        .await
         {
             Ok(Ok(registration)) => registration,
             Ok(Err((id, error))) => {
@@ -108,6 +116,9 @@ async fn serve(app: Arc<App>, socket: WebSocket) {
     };
     drop(tx);
     let registration = Arc::new(registration);
+    if registration.approved {
+        announce(&app, session.clone(), true).await;
+    }
     loop {
         let text = tokio::select! {
             _ = kill.notified() => break,
@@ -129,9 +140,36 @@ async fn serve(app: Arc<App>, socket: WebSocket) {
         }
         dispatch(&app, &session, &registration, frame).await;
     }
-    app.hub.unregister(&registration);
+    if app.hub.unregister(&registration) {
+        announce(&app, session.clone(), false).await;
+    }
     let _ = writer.await;
     tracing::debug!(device = %session.device, "连接断开");
+}
+
+/// 告诉能和这台设备对账的设备：它上线或下线了。查不到也没关系，对方下次兜底对账时一样补齐。
+async fn announce(app: &Arc<App>, session: Session, online: bool) {
+    app.with_store(move |locked, hub| {
+        let peers = match locked.store.peers_of(&session.uid) {
+            Ok(peers) => peers,
+            Err(error) => {
+                tracing::warn!(?error, "查不到这台设备的对账伙伴");
+                return;
+            }
+        };
+        let push = Push::Presence {
+            uid: session.uid.clone(),
+            device: session.device.clone(),
+            online,
+        };
+        let mut effects = Effects::default();
+        for uid in peers {
+            let target = Target::AccountExcept(uid, vec![session.device.clone()]);
+            effects.push(target, push.clone());
+        }
+        hub.apply(&effects, None);
+    })
+    .await;
 }
 
 fn err_frame(id: u64, err: WireError) -> ServerFrame {
@@ -143,6 +181,7 @@ async fn hello(
     stream: &mut futures_util::stream::SplitStream<WebSocket>,
     tx: &mpsc::Sender<Outbound>,
     kill: &Arc<Notify>,
+    relay_bytes: &Arc<AtomicUsize>,
     nonce: &Fixed<32>,
 ) -> Result<Registration, (u64, WireError)> {
     let text = next_text(stream)
@@ -196,11 +235,13 @@ async fn hello(
     };
     let tx = tx.clone();
     let kill = kill.clone();
+    let relay_bytes = relay_bytes.clone();
     app.with_store(move |locked, hub| {
         let (session, welcome, effects) =
             locked.store.login(login, device, &name, kind, now_ms())?;
         let approved = welcome.status == wire::DeviceStatus::Active;
-        let registration = hub.register(&session.uid, &session.device, approved, tx, kill);
+        let registration =
+            hub.register(&session.uid, &session.device, approved, tx, kill, relay_bytes);
         hub.reply(
             &registration,
             ServerFrame::Res {
@@ -228,10 +269,6 @@ async fn dispatch(
     app.with_store(move |locked, hub| {
         let id = frame.id;
         let now = now_ms();
-        let reading = matches!(
-            &frame.req,
-            Request::ReadingGet { .. } | Request::ReadingSet { .. }
-        );
         let friends = matches!(
             &frame.req,
             Request::FriendRequests { .. }
@@ -241,9 +278,6 @@ async fn dispatch(
         let result = run(locked, hub, &session, frame.req, now);
         match result {
             Ok((response, effects)) => {
-                if reading {
-                    hub.enable_reading(&registration);
-                }
                 if friends {
                     hub.enable_friends(&registration);
                 }
@@ -348,27 +382,14 @@ fn run(
         Request::JoinByInvite { conv, link, keys } => {
             store.join_by_invite(s, &conv, &link, &keys, now)
         }
-        Request::Send { env } => store.send(s, &env, &mut locked.limiter, now, true),
-        Request::SendLan { env } => store.send(s, &env, &mut locked.limiter, now, false),
-        Request::ReleaseMessage {
-            conv,
-            id,
-            direct_devices,
-        } => store.release_message(s, &conv, &id, &direct_devices),
-        Request::History {
-            conv,
-            before,
-            limit,
-            since_ms,
-            until_ms,
-        } => store.history(s, &conv, before, limit, since_ms, until_ms),
-        Request::Activity { since_ms } => store.activity(s, since_ms),
-        Request::Sync { since, limit } => store.sync(s, since, limit),
-        Request::FileCreate { conv, size } => store.file_create(s, &conv, size, now),
-        Request::ReadingMessages { conv, ids } => store.reading_messages(s, &conv, &ids),
-        Request::ReadingGet { conv, after, limit } => store.reading_get(s, &conv, after, limit),
-        Request::ReadingSet { envelope } => {
-            store.reading_set(s, &envelope, &mut locked.reading_limiter, now)
+        Request::Relay { to, conv, frame } => {
+            store.relay_check(s, &to, conv.as_ref(), &frame, &mut locked.limiter, now)?;
+            let size = frame.sealed.ct.len();
+            let online = hub.relay(&to, Push::Relayed { conv, frame }, size);
+            Ok((Response::Relayed { online }, Default::default()))
         }
+        Request::Peers => store.online_peers(s, &|uid| hub.online_devices(uid)),
+        Request::BeforeSend { conv, generation } => store.before_send(s, &conv, generation),
+        Request::Sync { since, limit } => store.sync(s, since, limit),
     }
 }

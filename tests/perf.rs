@@ -1,6 +1,6 @@
-//! 性能（契约 §7）：新电脑 1 万条历史 5 分钟内补齐、批准后 30 秒内出现会话列表、消息 2 秒内到对方。
+//! 性能（friend-im v10）：消息 2 秒内到对方；新电脑从开着的旧电脑补 1 万条历史 5 分钟内，补齐期间收发不受影响。
 //!
-//! 灌 1 万条消息要放宽发送频率，数字按发布构建量才有意义，默认不跑：
+//! 灌 1 万条要放宽转交频率，数字按发布构建量才有意义，默认不跑：
 //! `cargo test --release --test perf -- --ignored --nocapture`
 
 mod common;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use friend_im_client::core::ids::MsgId;
-use friend_im_client::{HistoryItem, Update};
+use friend_im_client::Update;
 
 const MESSAGES: usize = 10_000;
 
@@ -17,11 +17,11 @@ const MESSAGES: usize = 10_000;
 #[ignore = "量性能：cargo test --release --test perf -- --ignored --nocapture"]
 async fn new_computer_catches_up_ten_thousand_messages() {
     let env = Env::start_with(|c| {
-        c.send_per_second = 100_000;
-        c.send_per_minute = 1_000_000;
+        c.relay_per_second = 100_000;
+        c.relay_per_minute = 1_000_000;
     })
     .await;
-    let (mut alice, recovery) = env.account("alice", "台式机").await;
+    let (alice, recovery) = env.account("alice", "台式机").await;
     let (mut bob, _) = env.account("bob", "bob 的电脑").await;
     let dm = approved_dm(&bob.client, &alice.client).await;
 
@@ -29,7 +29,7 @@ async fn new_computer_catches_up_ten_thousand_messages() {
     let mut worst = Duration::ZERO;
     for i in 0..20 {
         let started = Instant::now();
-        alice.client.send(&dm, &MsgId::random(), text(&format!("延迟 {i}"))).await.unwrap();
+        alice.send_as(&dm, &MsgId::random(), text(&format!("延迟 {i}"))).await.unwrap();
         bob.wait_text(&format!("延迟 {i}")).await;
         worst = worst.max(started.elapsed());
     }
@@ -39,10 +39,15 @@ async fn new_computer_catches_up_ten_thousand_messages() {
     // 灌 1 万条（bob 发，alice 的台式机在线照常收）。
     let started = Instant::now();
     for i in 0..MESSAGES {
-        bob.client.send(&dm, &MsgId::random(), text(&format!("历史 {i}"))).await.unwrap();
+        bob.send_as(&dm, &MsgId::random(), text(&format!("历史 {i}"))).await.unwrap();
     }
     println!("发 {MESSAGES} 条用了 {:?}", started.elapsed());
-    alice.wait_text(&format!("历史 {}", MESSAGES - 1)).await;
+    let count = |peer: &Peer| peer.host.db.lock().unwrap().get(&dm).map_or(0, |rows| rows.len());
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while count(&alice) < MESSAGES + 20 {
+        assert!(Instant::now() < deadline, "alice 收不齐：{}", count(&alice));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // 新电脑用恢复密钥加入，量会话列表出现、全部历史补齐的时间。
     let mut laptop = env.device("alice", "笔记本").await;
@@ -52,33 +57,19 @@ async fn new_computer_catches_up_ten_thousand_messages() {
     let convs = laptop.client.convs().await.unwrap();
     assert!(convs.iter().any(|c| c.conv == dm));
     let listed = joined.elapsed();
-    let mut before = None;
-    let mut messages = 0;
-    let mut pages = 0;
-    loop {
-        let page = laptop.client.history(&dm, before, 100).await.unwrap();
-        pages += 1;
-        for item in &page.items {
-            match item {
-                HistoryItem::Message(_) => messages += 1,
-                HistoryItem::Rejected { reason, .. } => panic!("历史里有解不开的：{reason}"),
-                HistoryItem::Notice(_) => {}
-            }
-        }
-        if !page.more {
-            break;
-        }
-        before = page.items.iter().filter(|i| matches!(i, HistoryItem::Message(_))).map(HistoryItem::log).min();
-    }
-    let all = joined.elapsed();
-    println!("新电脑：会话列表 {listed:?}；{pages} 页、{messages} 条历史全部补齐 {all:?}");
-    assert_eq!(messages, MESSAGES + 20);
-    assert!(listed < Duration::from_secs(30));
-    assert!(all < Duration::from_secs(300));
 
-    // 补齐期间收发新消息不受影响。
-    let started = Instant::now();
-    bob.client.send(&dm, &MsgId::random(), text("补齐之后")).await.unwrap();
-    laptop.wait_text("补齐之后").await;
-    println!("补齐后新消息到新电脑：{:?}", started.elapsed());
+    // 补齐途中发一条，看是不是受影响。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let during = Instant::now();
+    bob.send_as(&dm, &MsgId::random(), text("补齐途中")).await.unwrap();
+    laptop.wait_text("补齐途中").await;
+    println!("补齐途中的新消息到新电脑：{:?}（此时已补 {} 条）", during.elapsed(), count(&laptop));
+    assert!(during.elapsed() < Duration::from_secs(10));
+
+    while count(&laptop) < MESSAGES + 21 {
+        assert!(joined.elapsed() < Duration::from_secs(300), "5 分钟内没补齐：{}", count(&laptop));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!("新电脑：会话列表 {listed:?}；{} 条历史全部补齐 {:?}", count(&laptop), joined.elapsed());
+    assert!(listed < Duration::from_secs(30));
 }

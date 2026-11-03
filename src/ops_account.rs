@@ -166,7 +166,6 @@ impl Store {
         }
         let welcome = Welcome {
             friend_requests: true,
-            reading: true,
             uid: uid.clone(),
             name: account.name,
             epoch: account.epoch,

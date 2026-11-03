@@ -1,19 +1,17 @@
-//! Friend-IM 服务器：账号、电脑、好友、群、密文消息与文件的存储和转发。只存密文，解不开。
+//! Friend-IM 服务器：账号、电脑、好友、群成员和加密钥匙的存储，加上在线设备之间的内存转交。
+//! 消息、文件和已读记录一律不存：接收设备不在线就回“不在线”，设备之间自己对账补齐。
 //!
 //! - `GET /v1/ws`：每台电脑一条 WebSocket 长连接（请求 / 回执 / 推送，格式见 `friend_im_core::wire`）。
-//! - `PUT` / `HEAD` / `GET /v1/files/{编号}`：文件按段上传、断点续传、按范围下载（只有密文）。
 //! - `GET /healthz`：健康检查。
 
 pub mod cindy;
 pub mod config;
-mod files;
 pub mod hub;
 mod ops_account;
 mod ops_conv;
 mod ops_friends;
 mod ops_join;
-mod ops_msg;
-mod ops_reading;
+mod ops_relay;
 pub mod store;
 mod ws;
 
@@ -21,18 +19,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 
 pub use ops_account::{LoginAuth, Session};
-use ops_msg::{RateLimiter, Uploads};
+use ops_relay::RateLimiter;
 
 /// 存储锁里的全部可变状态：所有写入串行执行，推送在锁里按日志顺序入队。
 pub struct Locked {
     pub store: store::Store,
     pub(crate) limiter: RateLimiter,
-    pub(crate) reading_limiter: RateLimiter,
-    pub(crate) uploads: Uploads,
 }
 
 /// 服务器的共享状态。
@@ -57,9 +52,7 @@ impl App {
         Ok(Arc::new(Self {
             locked: Mutex::new(Locked {
                 store,
-                limiter: RateLimiter::new(config.send_per_second, config.send_per_minute),
-                reading_limiter: RateLimiter::new(5, 60),
-                uploads: Uploads::default(),
+                limiter: RateLimiter::new(config.relay_per_second, config.relay_per_minute),
             }),
             hub: hub::Hub::default(),
             verifier: cindy::Verifier::new(config.issuers.clone()),
@@ -89,27 +82,15 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/ws", get(ws::upgrade))
-        .route(
-            "/v1/files/{file}",
-            get(files::download)
-                .head(files::progress)
-                .put(files::upload),
-        )
-        .layer(DefaultBodyLimit::max(
-            friend_im_core::limits::UPLOAD_PART_MAX,
-        ))
         .with_state(app)
 }
 
-/// 后台定时任务：作废过期的批准请求、清理没传完的文件。
+/// 后台定时任务：作废过期的批准请求与好友申请。
 pub fn spawn_maintenance(app: Arc<App>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
-        let mut rounds: u64 = 0;
         loop {
             tick.tick().await;
-            rounds += 1;
-            let cleanup = rounds.is_multiple_of(240);
             app.with_store(move |locked, hub| {
                 match locked.store.expire_friend_requests(now_ms()) {
                     Ok(effects) => {
@@ -122,13 +103,6 @@ pub fn spawn_maintenance(app: Arc<App>) {
                         hub.apply(&effects, None);
                     }
                     Err(error) => tracing::warn!(%error, "作废过期的批准请求失败"),
-                }
-                if cleanup {
-                    match locked.store.cleanup_uploads(now_ms()) {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(n, "清理了没传完的文件"),
-                        Err(error) => tracing::warn!(%error, "清理没传完的文件失败"),
-                    }
                 }
             })
             .await;

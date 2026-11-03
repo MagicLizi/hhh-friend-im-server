@@ -1,7 +1,8 @@
 //! 测试里的“HHH”：在进程内起一个真的 Friend-IM 插件（`friend_im::serve`，和程序走同一套代码），用管道和它讲协议。
 //!
 //! - 插件写出的每一行都按 JSON-RPC 解析，解不开的记下来（标准输出只能有协议消息，§3）；
-//! - 插件发来的请求：`events/push` 默认收下（可以改成拒收，测重推），`credential/save` 收下并记住；
+//! - 插件发来的请求：`events/push` 默认收下（可以改成拒收，测重推），`credential/save` 收下并记住，
+//!   `store/*` 从收下的推送里回答（provider-protocol v53，[`Library`] 就是这台电脑的宿主库，插件重启后还在）；
 //! - 插件发来的通知（`status`、`session/expired`、`login/failed`、`log/write`）全部记下；
 //! - `call` 发请求等回复；`wait` 等到插件发来的某样东西为止。
 
@@ -13,9 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use friend_im::Options;
+use base64::Engine as _;
 use hhh_im_protocol::method::EventsPushParams;
 use hhh_im_protocol::rpc::{RpcError, RpcId, RpcMessage, codec};
 use hhh_im_protocol::types::{Block, Event, Message};
+use sha2::{Digest, Sha256};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
@@ -36,6 +39,85 @@ pub enum Seen {
     Note(String, Value),
 }
 
+/// 一直试到 `f` 成功或超时（对账是异步的）。
+pub async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(value) = f().await {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "等不到{what}");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// 这台电脑的宿主库：收下的消息与文件。
+#[derive(Clone, Default)]
+pub struct Library {
+    pub messages: Arc<Mutex<std::collections::BTreeMap<String, HashMap<String, Message>>>>,
+    pub files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+impl Library {
+    fn absorb(&self, events: &[Event]) {
+        let mut db = self.messages.lock().unwrap();
+        for event in events {
+            if let Event::Messages { conversation_id, messages } = event {
+                let rows = db.entry(conversation_id.clone()).or_default();
+                for message in messages {
+                    match rows.get_mut(&message.id) {
+                        // 没带原始数据的（发送回执）不盖掉原件。
+                        Some(old) if message.raw.is_none() => old.created_at_ms = message.created_at_ms,
+                        _ => {
+                            rows.insert(message.id.clone(), message.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn answer(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        let not_found = || RpcError::from_kind(hhh_im_protocol::ErrorKind::NotFound, "本机没有这个文件。");
+        let db = self.messages.lock().unwrap();
+        let conv = params["conversationId"].as_str().unwrap_or_default();
+        Ok(match method {
+            "store/conversations" => {
+                let items: Vec<Value> = db
+                    .iter()
+                    .map(|(id, rows)| json!({ "conversationId": id, "count": rows.len(), "oldestMs": 0, "newestMs": 0 }))
+                    .collect();
+                json!({ "items": items })
+            }
+            "store/index" => {
+                let mut rows: Vec<&Message> = db.get(conv).map(|rows| rows.values().collect()).unwrap_or_default();
+                rows.sort_by_key(|m| (m.created_at_ms, m.id.clone()));
+                let items: Vec<Value> = rows
+                    .iter()
+                    .map(|m| {
+                        let digest = m.raw.as_ref().map(|raw| Sha256::digest(raw.data.as_bytes())[..16].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                        json!({ "id": m.id, "createdAtMs": m.created_at_ms, "deleted": m.deleted, "rawDigest": digest })
+                    })
+                    .collect();
+                json!({ "items": items })
+            }
+            "store/messages" => {
+                let ids: Vec<&str> = params["ids"].as_array().map(|ids| ids.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                let items: Vec<&Message> = ids.iter().filter_map(|id| db.get(conv).and_then(|rows| rows.get(*id))).collect();
+                json!({ "items": items })
+            }
+            "store/resource" => {
+                let files = self.files.lock().unwrap();
+                let bytes = files.get(params["key"].as_str().unwrap_or_default()).ok_or_else(not_found)?;
+                let offset = (params["offset"].as_u64().unwrap_or(0) as usize).min(bytes.len());
+                let end = (offset + params["length"].as_u64().unwrap_or(0) as usize).min(bytes.len());
+                json!({ "data": base64::engine::general_purpose::STANDARD.encode(&bytes[offset..end]), "total": bytes.len() })
+            }
+            other => return Err(RpcError::from_kind(hhh_im_protocol::ErrorKind::Unsupported, format!("测试宿主不认识 {other}"))),
+        })
+    }
+}
+
 /// 一个插件进程（在测试进程里）和它对面的“HHH”。
 pub struct Host {
     writer: Writer,
@@ -47,6 +129,8 @@ pub struct Host {
     pub bad_lines: Arc<Mutex<Vec<String>>>,
     /// 收不收推送（假时回错误，插件应当重推）。
     pub accept_pushes: Arc<AtomicBool>,
+    /// 这台电脑的宿主库。
+    pub library: Library,
     next: AtomicI64,
 }
 
@@ -61,18 +145,23 @@ impl Host {
     }
 
     pub async fn start_with(temp_dir: &std::path::Path, options: Options) -> (Self, Value) {
-        Self::start_reading_with(temp_dir, options, false).await
+        Self::start_reading_with(temp_dir, options, false, Library::default()).await
     }
 
     pub async fn start_reading(temp_dir: &std::path::Path) -> (Self, Value) {
-        Self::start_reading_with(temp_dir, options(), true).await
+        Self::start_reading_with(temp_dir, options(), true, Library::default()).await
     }
 
-    async fn start_reading_with(temp_dir: &std::path::Path, options: Options, reading_events: bool) -> (Self, Value) {
+    /// 起一个插件，宿主库用现成的（插件重启）。
+    pub async fn restart(temp_dir: &std::path::Path, library: Library) -> (Self, Value) {
+        Self::start_reading_with(temp_dir, options(), false, library).await
+    }
+
+    async fn start_reading_with(temp_dir: &std::path::Path, options: Options, reading_events: bool, library: Library) -> (Self, Value) {
         let (to_plugin, plugin_in) = tokio::io::duplex(8 << 20);
         let (plugin_out, from_plugin) = tokio::io::duplex(8 << 20);
         tokio::spawn(friend_im::serve(plugin_in, plugin_out, options));
-        Self::connect(Box::new(to_plugin), from_plugin, None, temp_dir, reading_events).await
+        Self::connect(Box::new(to_plugin), from_plugin, None, temp_dir, reading_events, library).await
     }
 
     /// 起真的插件程序（子进程，标准输入输出讲协议），握手。
@@ -88,10 +177,10 @@ impl Host {
             .unwrap_or_else(|e| panic!("起不了插件程序 {}：{e}", program.display()));
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        Self::connect(Box::new(stdin), stdout, Some(child), temp_dir, false).await
+        Self::connect(Box::new(stdin), stdout, Some(child), temp_dir, false, Library::default()).await
     }
 
-    async fn connect(writer: Box<dyn AsyncWrite + Send + Unpin>, reader: impl AsyncRead + Unpin + Send + 'static, child: Option<tokio::process::Child>, temp_dir: &std::path::Path, reading_events: bool) -> (Self, Value) {
+    async fn connect(writer: Box<dyn AsyncWrite + Send + Unpin>, reader: impl AsyncRead + Unpin + Send + 'static, child: Option<tokio::process::Child>, temp_dir: &std::path::Path, reading_events: bool, library: Library) -> (Self, Value) {
         let host = Self {
             writer: Arc::new(tokio::sync::Mutex::new(writer)),
             child,
@@ -99,6 +188,7 @@ impl Host {
             seen: Arc::default(),
             bad_lines: Arc::default(),
             accept_pushes: Arc::new(AtomicBool::new(true)),
+            library: library.clone(),
             next: AtomicI64::new(1),
         };
         tokio::spawn(read_loop(
@@ -108,6 +198,7 @@ impl Host {
             host.seen.clone(),
             host.bad_lines.clone(),
             host.accept_pushes.clone(),
+            library,
         ));
         let init = host
             .call(
@@ -235,6 +326,14 @@ impl Host {
         .await
     }
 
+    /// 宿主库里这个会话的消息，按所有设备一样的顺序。
+    pub fn stored(&self, conv: &str) -> Vec<Message> {
+        let db = self.library.messages.lock().unwrap();
+        let mut rows: Vec<Message> = db.get(conv).map(|rows| rows.values().cloned().collect()).unwrap_or_default();
+        rows.sort_by_key(|m| (m.created_at_ms, m.id.clone()));
+        rows
+    }
+
     /// 最后一次推送带的同步位置。
     pub fn last_sync_state(&self) -> Option<String> {
         self.seen.lock().unwrap().iter().rev().find_map(|s| match s {
@@ -320,6 +419,7 @@ async fn read_loop(
     seen: Arc<Mutex<Vec<Seen>>>,
     bad_lines: Arc<Mutex<Vec<String>>>,
     accept: Arc<AtomicBool>,
+    library: Library,
 ) {
     let mut lines = BufReader::new(from_plugin).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -346,8 +446,12 @@ async fn read_loop(
         let reply = match method.as_str() {
             "events/push" => {
                 let push: EventsPushParams = serde_json::from_value(params).expect("推送的参数合协议");
+                let accepted = accept.load(Ordering::SeqCst);
+                if accepted {
+                    library.absorb(&push.events);
+                }
                 seen.lock().unwrap().push(Seen::Push(push));
-                if accept.load(Ordering::SeqCst) {
+                if accepted {
                     RpcMessage::ok(id, json!({}))
                 } else {
                     RpcMessage::err(id, RpcError::from_kind(hhh_im_protocol::ErrorKind::Disconnected, "测试：这批先不收"))
@@ -357,7 +461,10 @@ async fn read_loop(
                 seen.lock().unwrap().push(Seen::Save(params["credential"].as_str().unwrap_or_default().to_owned()));
                 RpcMessage::ok(id, json!({}))
             }
-            other => RpcMessage::err(id, RpcError::from_kind(hhh_im_protocol::ErrorKind::Unsupported, format!("测试宿主不认识 {other}"))),
+            other => match library.answer(other, &params) {
+                Ok(value) => RpcMessage::ok(id, value),
+                Err(error) => RpcMessage::err(id, error),
+            },
         };
         let line = codec::encode_line(&reply).unwrap();
         let mut writer = writer.lock().await;
